@@ -72,6 +72,7 @@ claude mcp add wayhand-mcp -- /absolute/path/to/target/release/wayhand-mcp
 | `scroll` | Wheel notches at `x,y`; positive `dy` scrolls down. |
 | `key` | Key combo such as `ctrl+shift+t`, `alt+F4`, `Return`. |
 | `type` | Type text; characters outside the US layout are pasted through the clipboard with `ctrl+v`. |
+| `calibrate` | Desktop target only: moves the real cursor to known positions, finds it in screenshots, fits and stores the pixel→pointer transform, reports the worst residual against the 3 px limit. |
 
 Coordinates are always pixel positions in the most recent screenshot of the
 same target, origin top-left. Sandbox coordinates map 1:1 onto the virtual
@@ -139,4 +140,11 @@ guard. Neither affects the sandbox target or the screenshot portal.
 - The uinput device is verified to build, but real desktop injection was not
   yet exercised on the development machine (pending a re-login into the
   `input` group).
-- Desktop screenshots exclude the cursor; sandbox screenshots include it.
+- Sandbox screenshots include the cursor. Whether the GNOME portal screenshot includes it is unverified; if it does not, `calibrate` reports that it cannot see the cursor and the linear mapping stays in effect.
+
+## Demo evidence
+
+`docs/demo/` holds screenshots taken through the MCP tools during the sandbox
+end-to-end run: the editor after launch, after `type`, after `ctrl+a`, and the
+context menu after `right_click`. The clipboard content was read back with
+`wl-paste` on the nested display and matched the typed and pasted text.

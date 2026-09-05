@@ -9,7 +9,7 @@
 
 ## 現況（2026-09-04）
 
-交付順序第 1、2 步已完成：全部工具、兩種 target、沙盒模式。沙盒端對端 demo（文字編輯器打字、中文貼上、全選複製、wl-paste 驗證）已在真機通過。真實桌面模式的注入與 `calibrate` 實測還沒，等使用者重新登入帶到 input 群組。
+交付順序第 1 到 3 步的程式都完成：全部工具、兩種 target、沙盒模式、`calibrate`。沙盒端對端 demo（文字編輯器打字、中文貼上、全選複製、wl-paste 驗證）已在真機通過，截圖在 `docs/demo/`。真實桌面模式的注入與 `calibrate` 實測還沒，等使用者重新登入帶到 input 群組後跑 `scripts/check.sh` 再做。
 
 已查證的環境：
 
@@ -108,4 +108,7 @@ cargo run --bin wayhand-mcp  # 以 stdio 啟動 server（給 claude mcp add 用�
 
 ## Follow-ups
 
-（目前無）
+- 真實桌面模式實測（需要重新登入帶到 input 群組）：`scripts/check.sh` 通過後，用 `target=desktop` 跑 move/click，確認 libinput 沒把 uinput 裝置誤判成觸控裝置；再跑 `calibrate`，看 portal 截圖裡有沒有游標（GNOME 的 portal 可能不含游標，那樣 calibrate 會明確回報失敗並維持線性對映）。
+- MCP 取消訊號（request cancellation）沒有傳進工具，取消後進行中的動作會做完。
+- 截圖與座標沒有綁定識別碼，只靠操作佇列序列化。單一呼叫者下沒問題。
+- `sandbox_start` 的視窗大小由 GNOME 決定，無法指定。
