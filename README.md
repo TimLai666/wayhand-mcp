@@ -21,7 +21,35 @@ and one keyboard focus and offers no way to deliver input to a background
 window. The desktop target is for the cases where Claude must operate windows
 that already exist on your real desktop.
 
-## Setup
+## Quick install
+
+One command downloads the latest release, installs `sway` and `wl-clipboard`
+(asks for sudo), sets up `/dev/uinput` access, pre-authorizes screenshots, and
+registers the server with every supported client it finds (`claude`, `codex`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TimLai666/wayhand-mcp/main/scripts/install.sh | bash
+```
+
+Options: `bash -s -- --claude` or `--codex` to register only one client,
+`--skip-sudo` to leave the system steps for later, `--version vX.Y.Z` to pin
+a release. Releases are x86_64 Linux tarballs with a `.sha256` next to them.
+
+## Codex
+
+The same server works with OpenAI Codex CLI. The installer runs
+`codex mcp add wayhand-mcp -- ~/.local/share/wayhand-mcp/wayhand-mcp`; to do
+it by hand, use that command or add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.wayhand-mcp]
+command = "/home/you/.local/share/wayhand-mcp/wayhand-mcp"
+```
+
+Codex launches MCP servers on the host, outside its own sandbox, so the
+uinput and portal access work the same way as under Claude Code.
+
+## Manual setup
 
 Build the release binary:
 
