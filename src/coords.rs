@@ -29,7 +29,7 @@ impl fmt::Display for CoordError {
 
 impl std::error::Error for CoordError {}
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transform {
     pub m11: f64,
     pub m12: f64,

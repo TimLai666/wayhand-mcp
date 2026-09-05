@@ -11,6 +11,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    calibrate::{self, Calibration},
     coords::Transform,
     inject::{Button, Injector},
     keys::{Combo, KeyMap, KeyStroke, Modifier, TextRun},
@@ -73,6 +74,7 @@ struct OperationState {
     budget: Arc<Budget>,
     keymap: KeyMap,
     screens: HashMap<Target, ScreenSize>,
+    calibration: Option<Calibration>,
     stop_release_done: bool,
 }
 
@@ -159,8 +161,11 @@ impl OperationState {
         let screen = self.screen(target)?;
         match target {
             Target::Desktop => {
-                let transform = Transform::linear(screen.width, screen.height)
-                    .map_err(|error| format!("invalid screenshot dimensions: {error}"))?;
+                let transform = match &self.calibration {
+                    Some(c) if c.width == screen.width && c.height == screen.height => c.transform,
+                    _ => Transform::linear(screen.width, screen.height)
+                        .map_err(|error| format!("invalid screenshot dimensions: {error}"))?,
+                };
                 let point = transform
                     .map_pixel(x, y, screen.width, screen.height)
                     .map_err(|error| error.to_string())?;
@@ -596,6 +601,7 @@ impl DesktopServer {
                 budget,
                 keymap,
                 screens: HashMap::new(),
+                calibration: calibrate::load_calibration(),
                 stop_release_done: false,
             })),
             tool_router: Self::tool_router(),
@@ -777,6 +783,84 @@ impl DesktopServer {
         Ok(text_result(message))
     }
 
+    async fn calibrate_action(&self) -> Result<CallToolResult, String> {
+        let mut operation = self.operation.lock().await;
+        let mut shots: Vec<(u32, u32, calibrate::Image)> = Vec::new();
+        for fraction in calibrate::PROBE_FRACTIONS {
+            let (ax, ay) = calibrate::probe_abs(fraction);
+            operation
+                .run_steps(
+                    Target::Desktop,
+                    vec![Step::Move(ax, ay), Step::Sleep(Duration::from_millis(200))],
+                )
+                .await?;
+            let captured = self.capture(&mut operation, Target::Desktop).await?;
+            let image = calibrate::Image::from_png(&captured.bytes)
+                .map_err(|error| format!("decode calibration screenshot: {error:#}"))?;
+            shots.push((ax, ay, image));
+        }
+        let screen = operation.screen(Target::Desktop)?;
+        let expected = |ax: u32, ay: u32| {
+            (
+                f64::from(ax) * f64::from(screen.width.saturating_sub(1))
+                    / f64::from(crate::coords::ABSOLUTE_MAX),
+                f64::from(ay) * f64::from(screen.height.saturating_sub(1))
+                    / f64::from(crate::coords::ABSOLUTE_MAX),
+            )
+        };
+        let (base_ax, base_ay, baseline) = &shots[0];
+        let mut pairs: Vec<calibrate::Observation> = Vec::new();
+        let mut baseline_seen = false;
+        for (ax, ay, image) in &shots[1..] {
+            let blobs =
+                calibrate::changed_blobs(baseline, image).map_err(|error| error.to_string())?;
+            if blobs.is_empty() {
+                return Err(format!(
+                    "calibration failed: no cursor-sized change between screenshots at ABS ({base_ax},{base_ay}) and ({ax},{ay}). Either the portal screenshot does not include the cursor or uinput moves are not reaching the compositor (run scripts/check.sh). Keeping the linear mapping."
+                ));
+            }
+            let Some(blob) = calibrate::closest_blob(&blobs, expected(*ax, *ay)) else {
+                continue;
+            };
+            pairs.push((blob.hotspot(), (f64::from(*ax), f64::from(*ay))));
+            if !baseline_seen
+                && blobs.len() >= 2
+                && let Some(base_blob) =
+                    calibrate::closest_blob(&blobs, expected(*base_ax, *base_ay))
+                && base_blob != blob
+            {
+                pairs.push((
+                    base_blob.hotspot(),
+                    (f64::from(*base_ax), f64::from(*base_ay)),
+                ));
+                baseline_seen = true;
+            }
+        }
+        let (transform, residual) =
+            calibrate::fit_transform(&pairs).map_err(|error| error.to_string())?;
+        let calibration = Calibration {
+            width: screen.width,
+            height: screen.height,
+            transform,
+            max_residual_px: residual,
+            calibrated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        let path = calibrate::save_calibration(&calibration).map_err(|error| error.to_string())?;
+        operation.calibration = Some(calibration);
+        let verdict = if residual < 3.0 {
+            "within the 3 px acceptance limit"
+        } else {
+            "ABOVE the 3 px acceptance limit; re-run with the desktop idle"
+        };
+        Ok(text_result(format!(
+            "calibrated desktop target from {} cursor observations on a {}x{} screenshot; worst residual {residual:.2} px ({verdict}); saved to {}",
+            pairs.len(),
+            screen.width,
+            screen.height,
+            path.display()
+        )))
+    }
+
     async fn observe(
         &self,
         args: ObservationArgs,
@@ -942,6 +1026,17 @@ impl DesktopServer {
     }
 
     #[tool(
+        name = "calibrate",
+        description = "Desktop target only. Measures the mapping between screenshot pixels and the real pointer: moves the real cursor to 4 known positions, screenshots each, locates the cursor and fits an affine transform, then stores it for later desktop-target actions. The user must not touch the mouse while it runs (about 3 seconds). Not needed for the sandbox target, whose coordinates are exact by construction."
+    )]
+    async fn calibrate(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        wrap(self.calibrate_action().await)
+    }
+
+    #[tool(
         name = "sandbox_start",
         description = "Start the sandbox desktop: a nested sway compositor that appears as one window on the user's GNOME desktop. Apps launched with sandbox_launch run inside it and are driven without touching the user's real mouse or keyboard; the user can keep working and may move the window to another workspace. Returns the nested WAYLAND_DISPLAY name. Safe to call when already running."
     )]
@@ -1084,6 +1179,7 @@ mod tests {
             budget: Arc::new(Budget::with_config(100, Duration::ZERO)),
             keymap: KeyMap::us().unwrap(),
             screens: HashMap::new(),
+            calibration: None,
             stop_release_done: false,
         }
     }
