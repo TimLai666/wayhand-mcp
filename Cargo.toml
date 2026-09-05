@@ -1,0 +1,26 @@
+[package]
+name = "wayhand-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+default-run = "desktop-driver"
+
+[[bin]]
+name = "desktop-driver"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+ashpd = { version = "=0.13.13", default-features = false, features = ["screenshot", "tokio"] }
+base64 = "0.22.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+libc = "=0.2.189"
+png = "=0.18.1"
+rmcp = { version = "=3.2.0", features = ["transport-io"] }
+evdev = "=0.13.2"
+rustix = { version = "=1.1.4", features = ["fs"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
