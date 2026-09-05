@@ -50,10 +50,18 @@ INSTALL_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/wayhand-mcp"
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 
+# 執行中的舊版不能直接覆蓋（text file busy），先寫暫存檔再原子替換；
+# 舊程序繼續用舊的 inode，新 session 才會用新版。
+install_binary() {
+  cp "$1" "$INSTALL_ROOT/wayhand-mcp.new"
+  chmod +x "$INSTALL_ROOT/wayhand-mcp.new"
+  mv -f "$INSTALL_ROOT/wayhand-mcp.new" "$INSTALL_ROOT/wayhand-mcp"
+}
+
 echo "[1/5] 取得 wayhand-mcp"
 if [[ -n "$LOCAL_DIR" ]]; then
   [[ -x "$LOCAL_DIR/target/release/wayhand-mcp" ]] || { echo "找不到 $LOCAL_DIR/target/release/wayhand-mcp，先 cargo build --release" >&2; exit 1; }
-  cp "$LOCAL_DIR/target/release/wayhand-mcp" "$INSTALL_ROOT/wayhand-mcp"
+  install_binary "$LOCAL_DIR/target/release/wayhand-mcp"
   rm -rf "$INSTALL_ROOT/scripts" && cp -r "$LOCAL_DIR/scripts" "$INSTALL_ROOT/scripts"
 else
   command -v curl >/dev/null || { echo "需要 curl" >&2; exit 1; }
@@ -70,10 +78,10 @@ else
   curl -fsSL -o "$TMP/$ASSET.sha256" "$URL.sha256"
   (cd "$TMP" && sha256sum -c "$ASSET.sha256" --quiet)
   tar -xzf "$TMP/$ASSET" -C "$TMP"
-  cp "$TMP/wayhand-mcp" "$INSTALL_ROOT/wayhand-mcp"
+  install_binary "$TMP/wayhand-mcp"
   rm -rf "$INSTALL_ROOT/scripts" && cp -r "$TMP/scripts" "$INSTALL_ROOT/scripts"
 fi
-chmod +x "$INSTALL_ROOT/wayhand-mcp" "$INSTALL_ROOT"/scripts/*.sh
+chmod +x "$INSTALL_ROOT"/scripts/*.sh
 ln -sf "$INSTALL_ROOT/wayhand-mcp" "$BIN_DIR/wayhand-mcp"
 echo "      安裝到 $INSTALL_ROOT，指令連結 $BIN_DIR/wayhand-mcp"
 
