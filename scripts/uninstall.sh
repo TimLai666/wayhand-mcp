@@ -3,7 +3,8 @@
 # 需要 root：sudo scripts/uninstall.sh
 set -euo pipefail
 
-RULE_FILE=/etc/udev/rules.d/80-wayhand-uinput.rules
+RULE_FILE=/etc/udev/rules.d/60-wayhand-uinput.rules
+LEGACY_RULE_FILE=/etc/udev/rules.d/80-wayhand-uinput.rules
 GROUP=input
 
 if [[ $EUID -ne 0 ]]; then
@@ -20,15 +21,16 @@ has_wayhand_marker() {
 }
 
 echo "[1/3] 移除 udev rule：$RULE_FILE"
-if [[ -f "$RULE_FILE" ]]; then
-  if has_wayhand_marker "$RULE_FILE"; then
-    rm -f "$RULE_FILE"
-  else
-    echo "      找不到 wayhand-mcp 標記，保留：$RULE_FILE"
+for file in "$RULE_FILE" "$LEGACY_RULE_FILE"; do
+  if [[ -f "$file" ]]; then
+    if has_wayhand_marker "$file"; then
+      rm -f "$file"
+      echo "      已移除：$file"
+    else
+      echo "      找不到 wayhand-mcp 標記，保留：$file"
+    fi
   fi
-else
-  echo "      不存在，略過"
-fi
+done
 
 echo "[2/3] 把使用者從 $GROUP 群組移除"
 if [[ -n "$TARGET_USER" && "$TARGET_USER" != root ]] && id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx "$GROUP"; then

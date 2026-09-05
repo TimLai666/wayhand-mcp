@@ -294,28 +294,44 @@ fn click_steps(x: u32, y: u32, button: Button, count: u32) -> Vec<Step> {
     steps
 }
 
-fn drag_steps(points: &[(u32, u32)], step_px: u32, hold: Duration) -> Vec<Step> {
+/// Interpolate a polyline in screenshot pixels so consecutive points are at
+/// most `step_px` apart. The first point is included.
+fn interpolate_pixels(points: &[(i64, i64)], step_px: u32) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let Some(&first) = points.first() else {
+        return out;
+    };
+    out.push(first);
+    for pair in points.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let dx = (to.0 - from.0) as f64;
+        let dy = (to.1 - from.1) as f64;
+        let distance = (dx * dx + dy * dy).sqrt();
+        let count = (distance / f64::from(step_px.max(1))).ceil().max(1.0) as u32;
+        for index in 1..=count {
+            let t = f64::from(index) / f64::from(count);
+            out.push((
+                (from.0 as f64 + dx * t).round() as i64,
+                (from.1 as f64 + dy * t).round() as i64,
+            ));
+        }
+    }
+    out
+}
+
+/// Steps for a drag along already-mapped injector coordinates.
+fn drag_steps(path: &[(u32, u32)], hold: Duration) -> Vec<Step> {
     let mut steps = Vec::new();
-    let Some(&(start_x, start_y)) = points.first() else {
+    let Some(&(start_x, start_y)) = path.first() else {
         return steps;
     };
     steps.push(Step::Move(start_x, start_y));
     steps.push(Step::Sleep(hold));
     steps.push(Step::Button(Button::Left, true));
     steps.push(Step::Sleep(hold));
-    for pair in points.windows(2) {
-        let (from, to) = (pair[0], pair[1]);
-        let dx = f64::from(to.0) - f64::from(from.0);
-        let dy = f64::from(to.1) - f64::from(from.1);
-        let distance = (dx * dx + dy * dy).sqrt();
-        let count = (distance / f64::from(step_px.max(1))).ceil().max(1.0) as u32;
-        for index in 1..=count {
-            let t = f64::from(index) / f64::from(count);
-            let x = (f64::from(from.0) + dx * t).round() as u32;
-            let y = (f64::from(from.1) + dy * t).round() as u32;
-            steps.push(Step::Move(x, y));
-            steps.push(Step::Sleep(DRAG_STEP_PAUSE));
-        }
+    for &(x, y) in &path[1..] {
+        steps.push(Step::Move(x, y));
+        steps.push(Step::Sleep(DRAG_STEP_PAUSE));
     }
     steps.push(Step::Sleep(hold));
     steps.push(Step::Button(Button::Left, false));
@@ -698,14 +714,16 @@ impl DesktopServer {
         let step_px = args.step_px.unwrap_or(20).clamp(1, 500);
         let hold = Duration::from_millis(args.hold_ms.unwrap_or(50).min(2000));
         let mut operation = self.operation.lock().await;
-        let mut points = Vec::with_capacity(args.waypoints.len() + 2);
-        for point in std::iter::once(args.from)
+        let pixel_points: Vec<(i64, i64)> = std::iter::once(args.from)
             .chain(args.waypoints.iter().copied())
             .chain(std::iter::once(args.to))
-        {
-            points.push(operation.map_point(target, point.x, point.y)?);
+            .map(|point| (point.x, point.y))
+            .collect();
+        let mut path = Vec::new();
+        for (x, y) in interpolate_pixels(&pixel_points, step_px) {
+            path.push(operation.map_point(target, x, y)?);
         }
-        let steps = drag_steps(&points, step_px, hold);
+        let steps = drag_steps(&path, hold);
         operation.run_steps(target, steps).await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
@@ -785,59 +803,127 @@ impl DesktopServer {
 
     async fn calibrate_action(&self) -> Result<CallToolResult, String> {
         let mut operation = self.operation.lock().await;
-        let mut shots: Vec<(u32, u32, calibrate::Image)> = Vec::new();
+        if operation.sandbox.is_none() {
+            let keymap = &operation.keymap;
+            let sandbox = tokio::task::block_in_place(|| Sandbox::start(keymap))
+                .map_err(|error| format!("calibrate needs the sandbox window as a measuring target; sandbox_start failed: {error:#}"))?;
+            operation.sandbox = Some(sandbox);
+            operation.screens.remove(&Target::Sandbox);
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+
+        let desktop_shot = self.capture(&mut operation, Target::Desktop).await?;
+        let desktop_image = calibrate::Image::from_png(&desktop_shot.bytes)
+            .map_err(|error| format!("decode desktop screenshot: {error:#}"))?;
+        let rect = calibrate::find_sandbox_rect(&desktop_image).map_err(|error| {
+            format!("{error:#}. The sandbox window must be visible and not covered on the real desktop while calibrate runs.")
+        })?;
+        let sandbox_shot = self.capture(&mut operation, Target::Sandbox).await?;
+        let scale_x = f64::from(rect.width) / f64::from(sandbox_shot.width);
+        let scale_y = f64::from(rect.height) / f64::from(sandbox_shot.height);
+        let screen = operation.screen(Target::Desktop)?;
+        let linear = Transform::linear(screen.width, screen.height).map_err(|e| e.to_string())?;
+
+        let mut observations: Vec<calibrate::Probe> = Vec::new();
         for fraction in calibrate::PROBE_FRACTIONS {
-            let (ax, ay) = calibrate::probe_abs(fraction);
+            let intended = (
+                f64::from(rect.x) + fraction.0 * f64::from(rect.width),
+                f64::from(rect.y) + fraction.1 * f64::from(rect.height),
+            );
+            let point = linear
+                .map_pixel(
+                    intended.0.round() as i64,
+                    intended.1.round() as i64,
+                    screen.width,
+                    screen.height,
+                )
+                .map_err(|e| e.to_string())?;
+            let abs = (u32::from(point.x), u32::from(point.y));
             operation
                 .run_steps(
                     Target::Desktop,
-                    vec![Step::Move(ax, ay), Step::Sleep(Duration::from_millis(200))],
+                    vec![
+                        Step::Move(abs.0, abs.1),
+                        Step::Sleep(Duration::from_millis(250)),
+                    ],
                 )
                 .await?;
-            let captured = self.capture(&mut operation, Target::Desktop).await?;
-            let image = calibrate::Image::from_png(&captured.bytes)
-                .map_err(|error| format!("decode calibration screenshot: {error:#}"))?;
-            shots.push((ax, ay, image));
-        }
-        let screen = operation.screen(Target::Desktop)?;
-        let expected = |ax: u32, ay: u32| {
-            (
-                f64::from(ax) * f64::from(screen.width.saturating_sub(1))
-                    / f64::from(crate::coords::ABSOLUTE_MAX),
-                f64::from(ay) * f64::from(screen.height.saturating_sub(1))
-                    / f64::from(crate::coords::ABSOLUTE_MAX),
-            )
-        };
-        let (base_ax, base_ay, baseline) = &shots[0];
-        let mut pairs: Vec<calibrate::Observation> = Vec::new();
-        let mut baseline_seen = false;
-        for (ax, ay, image) in &shots[1..] {
-            let blobs =
-                calibrate::changed_blobs(baseline, image).map_err(|error| error.to_string())?;
-            if blobs.is_empty() {
+            let shot = self.capture(&mut operation, Target::Sandbox).await?;
+            let image = calibrate::Image::from_png(&shot.bytes)
+                .map_err(|error| format!("decode sandbox screenshot: {error:#}"))?;
+            let Some(cursor) = calibrate::find_cursor_on_bg(&image) else {
                 return Err(format!(
-                    "calibration failed: no cursor-sized change between screenshots at ABS ({base_ax},{base_ay}) and ({ax},{ay}). Either the portal screenshot does not include the cursor or uinput moves are not reaching the compositor (run scripts/check.sh). Keeping the linear mapping."
+                    "calibration failed: no cursor visible in the sandbox after moving the real pointer to desktop pixel ({:.0}, {:.0}). Either uinput moves do not reach the compositor or the sandbox window is covered.",
+                    intended.0, intended.1
                 ));
-            }
-            let Some(blob) = calibrate::closest_blob(&blobs, expected(*ax, *ay)) else {
-                continue;
             };
-            pairs.push((blob.hotspot(), (f64::from(*ax), f64::from(*ay))));
-            if !baseline_seen
-                && blobs.len() >= 2
-                && let Some(base_blob) =
-                    calibrate::closest_blob(&blobs, expected(*base_ax, *base_ay))
-                && base_blob != blob
-            {
-                pairs.push((
-                    base_blob.hotspot(),
-                    (f64::from(*base_ax), f64::from(*base_ay)),
-                ));
-                baseline_seen = true;
-            }
+            let (hx, hy) = cursor.hotspot();
+            let observed = (
+                f64::from(rect.x) + hx * scale_x,
+                f64::from(rect.y) + hy * scale_y,
+            );
+            observations.push((observed, (f64::from(abs.0), f64::from(abs.1)), intended));
         }
-        let (transform, residual) =
-            calibrate::fit_transform(&pairs).map_err(|error| error.to_string())?;
+
+        // The cursor image's top-left sits a constant few pixels from the hotspot;
+        // that constant is not a mapping error, so judge the spread around it.
+        let n = observations.len() as f64;
+        let mean = observations
+            .iter()
+            .fold((0.0, 0.0), |acc, (obs, _, intended)| {
+                (
+                    acc.0 + (obs.0 - intended.0) / n,
+                    acc.1 + (obs.1 - intended.1) / n,
+                )
+            });
+        let deviation = observations
+            .iter()
+            .map(|(obs, _, intended)| {
+                ((obs.0 - intended.0 - mean.0).powi(2) + (obs.1 - intended.1 - mean.1).powi(2))
+                    .sqrt()
+            })
+            .fold(0.0f64, f64::max);
+
+        let summary = format!(
+            "sandbox window at ({}, {}) {}x{} desktop px (scale {:.2}); constant cursor-image offset ({:+.1}, {:+.1}) px; worst deviation {deviation:.2} px across {} probes",
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            scale_x,
+            mean.0,
+            mean.1,
+            observations.len()
+        );
+        if deviation < 3.0 {
+            let calibration = Calibration {
+                width: screen.width,
+                height: screen.height,
+                transform: linear,
+                max_residual_px: deviation,
+                calibrated_at: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            };
+            let path = calibrate::save_calibration(&calibration).map_err(|e| e.to_string())?;
+            operation.calibration = Some(calibration);
+            return Ok(text_result(format!(
+                "linear desktop mapping verified within the 3 px limit: {summary}; saved to {}",
+                path.display()
+            )));
+        }
+
+        let pairs: Vec<calibrate::Observation> = observations
+            .iter()
+            .map(|(obs, abs, _)| ((obs.0 - mean.0, obs.1 - mean.1), *abs))
+            .collect();
+        let (transform, residual) = calibrate::fit_transform(&pairs).map_err(|e| e.to_string())?;
+        if residual >= 3.0 {
+            operation.calibration = None;
+            let _ = calibrate::calibration_path().map(std::fs::remove_file);
+            return Err(format!(
+                "calibration rejected: {summary}; an affine fit still leaves {residual:.2} px. Keeping the linear mapping; nothing saved."
+            ));
+        }
         let calibration = Calibration {
             width: screen.width,
             height: screen.height,
@@ -845,18 +931,10 @@ impl DesktopServer {
             max_residual_px: residual,
             calibrated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
-        let path = calibrate::save_calibration(&calibration).map_err(|error| error.to_string())?;
+        let path = calibrate::save_calibration(&calibration).map_err(|e| e.to_string())?;
         operation.calibration = Some(calibration);
-        let verdict = if residual < 3.0 {
-            "within the 3 px acceptance limit"
-        } else {
-            "ABOVE the 3 px acceptance limit; re-run with the desktop idle"
-        };
         Ok(text_result(format!(
-            "calibrated desktop target from {} cursor observations on a {}x{} screenshot; worst residual {residual:.2} px ({verdict}); saved to {}",
-            pairs.len(),
-            screen.width,
-            screen.height,
+            "linear mapping was off ({summary}); fitted affine transform with residual {residual:.2} px saved to {}",
             path.display()
         )))
     }
@@ -1027,7 +1105,7 @@ impl DesktopServer {
 
     #[tool(
         name = "calibrate",
-        description = "Desktop target only. Measures the mapping between screenshot pixels and the real pointer: moves the real cursor to 4 known positions, screenshots each, locates the cursor and fits an affine transform, then stores it for later desktop-target actions. The user must not touch the mouse while it runs (about 3 seconds). Not needed for the sandbox target, whose coordinates are exact by construction."
+        description = "Desktop target only. Verifies the mapping between desktop screenshot pixels and the real pointer, using the sandbox window as a ruler: it starts the sandbox if needed, finds its window in a desktop screenshot, moves the real cursor to 4 positions inside it and reads the cursor back from sandbox screenshots. Reports the worst deviation against the 3 px limit and stores the result. The sandbox window must be visible and uncovered, and the user must not touch the mouse while it runs (about 4 seconds). Not needed for the sandbox target."
     )]
     async fn calibrate(
         &self,
@@ -1164,7 +1242,7 @@ mod tests {
 
     use super::{
         OperationState, ScreenSize, Step, Target, click_steps, combo_steps, drag_steps,
-        parse_scale_factor, type_steps,
+        interpolate_pixels, parse_scale_factor, type_steps,
     };
     use crate::{
         inject::{Button, fake::FakeInjector},
@@ -1200,8 +1278,26 @@ mod tests {
     }
 
     #[test]
+    fn interpolation_is_in_pixel_space() {
+        assert_eq!(
+            interpolate_pixels(&[(0, 0), (100, 0)], 25),
+            vec![(0, 0), (25, 0), (50, 0), (75, 0), (100, 0)]
+        );
+        let with_waypoint = interpolate_pixels(&[(0, 0), (10, 0), (10, 10)], 10);
+        assert_eq!(with_waypoint, vec![(0, 0), (10, 0), (10, 10)]);
+        assert_eq!(
+            interpolate_pixels(&[(5, 5), (5, 5)], 10),
+            vec![(5, 5), (5, 5)]
+        );
+    }
+
+    #[test]
     fn drag_interpolates_and_releases_last() {
-        let steps = drag_steps(&[(0, 0), (100, 0)], 25, Duration::ZERO);
+        let path: Vec<(u32, u32)> = interpolate_pixels(&[(0, 0), (100, 0)], 25)
+            .into_iter()
+            .map(|(x, y)| (x as u32, y as u32))
+            .collect();
+        let steps = drag_steps(&path, Duration::ZERO);
         assert_eq!(steps.first(), Some(&Step::Move(0, 0)));
         assert_eq!(steps.last(), Some(&Step::Button(Button::Left, false)));
         let moves: Vec<_> = steps
@@ -1223,7 +1319,7 @@ mod tests {
 
     #[test]
     fn drag_with_waypoint_visits_it() {
-        let steps = drag_steps(&[(0, 0), (10, 0), (10, 10)], 10, Duration::ZERO);
+        let steps = drag_steps(&[(0, 0), (10, 0), (10, 10)], Duration::ZERO);
         assert!(steps.contains(&Step::Move(10, 0)));
         assert_eq!(
             steps.iter().rev().find_map(|s| match s {

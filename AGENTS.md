@@ -9,7 +9,7 @@
 
 ## 現況（2026-09-04）
 
-交付順序第 1 到 3 步的程式都完成：全部工具、兩種 target、沙盒模式、`calibrate`。沙盒端對端 demo（文字編輯器打字、中文貼上、全選複製、wl-paste 驗證）已在真機通過，截圖在 `docs/demo/`。真實桌面模式的注入與 `calibrate` 實測還沒，等使用者重新登入帶到 input 群組後跑 `scripts/check.sh` 再做。
+交付順序四步都完成。沙盒 demo 與真實桌面 demo（以沙盒視窗當受測程式）都在真機通過，截圖在 `docs/demo/`。`calibrate` 用沙盒視窗當量尺，實測偏差 0.00 px。
 
 已查證的環境：
 
@@ -19,7 +19,7 @@
 | Rust | cargo 1.97.1（`~/.cargo/bin`） |
 | rmcp crate | crates.io 最新 3.2.0（`rmcp`、`rmcp-macros`），加依賴前用 `cargo info rmcp` 再確認 API |
 | ydotool | 未安裝。apt 的 0.1.8（2020 年）`mousemove` 只有相對移動、沒有 `--absolute`、沒有 `--socket-path`，也不附 systemd unit，不能用。上游最新 v1.0.4 才有這些。 |
-| `/dev/uinput` | 核心內建（`CONFIG_INPUT_UINPUT=y`），預設 `crw------- root root`。權限由 `scripts/setup.sh` 處理（udev rule + input 群組），需要 sudo 且要重新登入。 |
+| `/dev/uinput` | 核心內建（`CONFIG_INPUT_UINPUT=y`），預設 `crw------- root root`。權限由 `scripts/setup.sh` 處理（udev rule 帶 `uaccess` 標籤，logind 設 ACL；input 群組備用），需要 sudo，不用重新登入。 |
 | 其他 | `gnome-text-editor`、`wl-copy`、`wl-paste` 都在 `/usr/bin` |
 
 ## 技術選型
@@ -108,7 +108,9 @@ cargo run --bin wayhand-mcp  # 以 stdio 啟動 server（給 claude mcp add 用�
 
 ## Follow-ups
 
-- 真實桌面模式實測（需要重新登入帶到 input 群組）：`scripts/check.sh` 通過後，用 `target=desktop` 跑 move/click，確認 libinput 沒把 uinput 裝置誤判成觸控裝置；再跑 `calibrate`，看 portal 截圖裡有沒有游標（GNOME 的 portal 可能不含游標，那樣 calibrate 會明確回報失敗並維持線性對映）。
+- uinput 權限用 udev `TAG+="uaccess"`（rule 檔編號必須小於 73 才會生效）由 logind 設 ACL，不必重新登入；input 群組只是備用。
+- uinput 指標裝置只能宣告三個滑鼠鍵，宣告 BTN_TOOL_PEN/BTN_TOUCH 會被 udev 判成繪圖板而讓 Mutter 忽略絕對移動，所以鍵盤是另一個裝置。
+- GNOME portal 截圖不含游標，`calibrate` 改用沙盒視窗（純洋紅背景）當量尺。
 - MCP 取消訊號（request cancellation）沒有傳進工具，取消後進行中的動作會做完。
 - 截圖與座標沒有綁定識別碼，只靠操作佇列序列化。單一呼叫者下沒問題。
 - `sandbox_start` 的視窗大小由 GNOME 決定，無法指定。

@@ -36,15 +36,17 @@ the US keyboard layout cannot type:
 sudo apt install sway wl-clipboard
 ```
 
-For the desktop target, allow your user to open `/dev/uinput` (udev rule plus
-`input` group), then log out and back in:
+For the desktop target, allow your user to open `/dev/uinput`. The udev rule
+tags the device `uaccess`, so logind grants the logged-in user an ACL right
+away; membership in the `input` group is added as a fallback for non-seat
+sessions and only takes effect after the user session restarts.
 
 ```bash
 sudo scripts/setup.sh
 ```
 
-After logging in again, `scripts/check.sh` must report that `/dev/uinput` is
-writable. `sudo scripts/uninstall.sh` reverses the udev and group changes.
+`scripts/check.sh` must then report that `/dev/uinput` is writable.
+`sudo scripts/uninstall.sh` reverses the udev and group changes.
 
 Pre-authorize desktop screenshots so the portal never shows a permission
 dialog. Run it once from the same environment that will launch Claude Code
@@ -106,8 +108,10 @@ Typical flow: `sandbox_start` → `sandbox_launch ["gnome-text-editor", "--stand
 | Sandbox start (sway nested) | ~210 ms |
 | Sandbox screenshot (1280×720, screencopy → PNG) | ~165 ms |
 | Sandbox click including default 150 ms settle | ~152 ms |
-| Desktop screenshot via portal, after permission grant | ~510 ms (2880×1800) |
+| Desktop screenshot via portal, after permission grant | ~510-670 ms (2880×1800) |
 | Desktop screenshot, first call with permission dialog | ~8.4 s |
+| Desktop move / click / key via uinput | ~1 ms plus the 20 ms spacing |
+| `calibrate` on the desktop target | ~2.6 s, worst deviation 0.00 px at 2× scale |
 
 ## Test-only switches
 
@@ -135,12 +139,13 @@ guard. Neither affects the sandbox target or the screenshot portal.
   `ctrl+v`, so it only works in apps that accept paste, and it replaces the
   clipboard content.
 - Touchpad gestures (multi-finger swipe, pinch) cannot be produced.
-- Desktop-target coordinates use a linear mapping; multi-monitor layouts and
-  the sub-3-pixel calibration check are not verified yet.
-- The uinput device is verified to build, but real desktop injection was not
-  yet exercised on the development machine (pending a re-login into the
-  `input` group).
-- Sandbox screenshots include the cursor. Whether the GNOME portal screenshot includes it is unverified; if it does not, `calibrate` reports that it cannot see the cursor and the linear mapping stays in effect.
+- Desktop-target coordinates use a linear mapping over one screen;
+  multi-monitor layouts are not handled.
+- Desktop screenshots from the GNOME portal do not include the cursor, which
+  is why `calibrate` measures through the sandbox window instead.
+- The clipboard fallback of `type` writes to the compositor of the chosen
+  `target`. With `target=desktop` the text lands on the real desktop clipboard,
+  so pasting into an app that runs inside the sandbox does not work that way.
 
 ## Demo evidence
 
@@ -148,3 +153,9 @@ guard. Neither affects the sandbox target or the screenshot portal.
 end-to-end run: the editor after launch, after `type`, after `ctrl+a`, and the
 context menu after `right_click`. The clipboard content was read back with
 `wl-paste` on the nested display and matched the typed and pasted text.
+
+The desktop target was exercised the same way with the real pointer and
+keyboard devices, using the sandbox window as the application under test:
+`click` into it, `type`, `ctrl+a`, `drag`, `scroll`, `right_click` all
+arrived (`docs/demo/desktop-*.png`), and `calibrate` measured the linear
+mapping at 0.00 px deviation.

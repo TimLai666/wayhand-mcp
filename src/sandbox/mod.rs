@@ -22,6 +22,7 @@ use wl::WlClient;
 
 const SWAY_CONFIG: &str = "default_border none\n\
 focus_follows_mouse no\n\
+output * bg #ff00ff solid_color\n\
 exec sh -c 'printf %s \"$WAYLAND_DISPLAY\" > \"$WAYHAND_SANDBOX_DIR/display\"'\n";
 
 pub struct Sandbox {

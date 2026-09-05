@@ -90,6 +90,6 @@ Real uinput and the portal are exercised only in the manual demo on the develope
 
 ## Hidden assumptions
 
-- The portal keeps answering without a dialog after the first grant - risk: if GNOME prompts every call, the loop needs the ScreenCast portal instead. Unverified as of 2026-09-04.
-- libinput accepts a uinput device advertising ABS_X/ABS_Y plus every key code as a pointer - risk: it may classify it as a tablet or touchscreen and drop button events. Verified only after re-login with real uinput.
+- Verified 2026-09-05: the portal answers without a dialog once the permission store holds "yes" for the launching app id (`scripts/grant-screenshot.sh`). The portal screenshot never includes the cursor.
+- Verified 2026-09-05: a single uinput device advertising every key code IS classified as a tablet and Mutter drops its absolute motion. The pointer device now advertises only BTN_LEFT/RIGHT/MIDDLE + wheel + ABS_X/Y (QEMU usb-tablet shape) and the keyboard is a second device; calibrate measured 0.00 px deviation.
 - Only one client drives the server at a time - risk: concurrent tool calls share one injector mutex and one screen size, ordering is not guaranteed across clients.

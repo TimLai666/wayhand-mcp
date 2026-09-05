@@ -9,11 +9,19 @@ use evdev::{
 use super::{Button, Injector};
 
 const ABSOLUTE_MAX: i32 = 65_535;
-const KEY_MAX: u16 = 0x02ff;
+
+/// Highest keyboard key code advertised on the keyboard device (KEY_* range).
+/// BTN_* codes (0x100..) are deliberately excluded: advertising BTN_TOOL_PEN or
+/// BTN_TOUCH next to ABS_X/ABS_Y makes udev classify the device as a tablet or
+/// touchscreen, and Mutter then ignores plain absolute motion.
+const KEYBOARD_KEY_MAX: u16 = 0xff;
 
 #[derive(Debug)]
 pub struct UInputInjector {
-    device: Option<VirtualDevice>,
+    /// Absolute pointer shaped like a QEMU usb-tablet: ABS_X/ABS_Y, three
+    /// mouse buttons and wheel axes. libinput treats it as an absolute mouse.
+    pointer: Option<VirtualDevice>,
+    keyboard: Option<VirtualDevice>,
     unavailable_reason: Option<String>,
     pressed_buttons: HashSet<Button>,
     pressed_keys: HashSet<u16>,
@@ -21,10 +29,10 @@ pub struct UInputInjector {
 
 impl UInputInjector {
     pub fn new() -> Result<Self> {
-        let mut keys = AttributeSet::<KeyCode>::new();
-        for code in 0..=KEY_MAX {
-            keys.insert(KeyCode::new(code));
-        }
+        let mut buttons = AttributeSet::<KeyCode>::new();
+        buttons.insert(KeyCode::BTN_LEFT);
+        buttons.insert(KeyCode::BTN_RIGHT);
+        buttons.insert(KeyCode::BTN_MIDDLE);
 
         let mut relative_axes = AttributeSet::<RelativeAxisCode>::new();
         relative_axes.insert(RelativeAxisCode::REL_WHEEL);
@@ -39,22 +47,35 @@ impl UInputInjector {
             AbsInfo::new(0, 0, ABSOLUTE_MAX, 0, 0, 0),
         );
 
-        let device = VirtualDevice::builder()
+        let pointer = VirtualDevice::builder()
             .context("open /dev/uinput")?
-            .name("wayhand-mcp")
-            .with_keys(&keys)
-            .context("enable keyboard and button codes on uinput device")?
+            .name("wayhand-mcp pointer")
+            .with_keys(&buttons)
+            .context("enable mouse buttons on uinput pointer")?
             .with_relative_axes(&relative_axes)
-            .context("enable relative scroll axes on uinput device")?
+            .context("enable scroll axes on uinput pointer")?
             .with_absolute_axis(&x_axis)
-            .context("enable ABS_X on uinput device")?
+            .context("enable ABS_X on uinput pointer")?
             .with_absolute_axis(&y_axis)
-            .context("enable ABS_Y on uinput device")?
+            .context("enable ABS_Y on uinput pointer")?
             .build()
-            .context("create uinput virtual device")?;
+            .context("create uinput pointer device")?;
+
+        let mut keys = AttributeSet::<KeyCode>::new();
+        for code in 1..=KEYBOARD_KEY_MAX {
+            keys.insert(KeyCode::new(code));
+        }
+        let keyboard = VirtualDevice::builder()
+            .context("open /dev/uinput for keyboard")?
+            .name("wayhand-mcp keyboard")
+            .with_keys(&keys)
+            .context("enable key codes on uinput keyboard")?
+            .build()
+            .context("create uinput keyboard device")?;
 
         Ok(Self {
-            device: Some(device),
+            pointer: Some(pointer),
+            keyboard: Some(keyboard),
             unavailable_reason: None,
             pressed_buttons: HashSet::new(),
             pressed_keys: HashSet::new(),
@@ -63,23 +84,30 @@ impl UInputInjector {
 
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
-            device: None,
+            pointer: None,
+            keyboard: None,
             unavailable_reason: Some(reason.into()),
             pressed_buttons: HashSet::new(),
             pressed_keys: HashSet::new(),
         }
     }
 
-    fn device_mut(&mut self) -> Result<&mut VirtualDevice> {
-        if let Some(device) = self.device.as_mut() {
-            return Ok(device);
-        }
-
+    fn unavailable_error(&self) -> anyhow::Error {
         let reason = self
             .unavailable_reason
             .as_deref()
             .unwrap_or("the virtual device was not initialized");
-        Err(anyhow!("uinput backend unavailable: {reason}"))
+        anyhow!("uinput backend unavailable: {reason}")
+    }
+
+    fn pointer_mut(&mut self) -> Result<&mut VirtualDevice> {
+        let error = self.unavailable_error();
+        self.pointer.as_mut().ok_or(error)
+    }
+
+    fn keyboard_mut(&mut self) -> Result<&mut VirtualDevice> {
+        let error = self.unavailable_error();
+        self.keyboard.as_mut().ok_or(error)
     }
 }
 
@@ -96,7 +124,7 @@ impl Injector for UInputInjector {
             InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, x),
             InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, y),
         ];
-        self.device_mut()?.emit(&events)?;
+        self.pointer_mut()?.emit(&events)?;
         Ok(())
     }
 
@@ -107,7 +135,7 @@ impl Injector for UInputInjector {
             Button::Middle => KeyCode::BTN_MIDDLE,
         };
         let event = InputEvent::new(EventType::KEY.0, code.0, if pressed { 1 } else { 0 });
-        let result = self.device_mut()?.emit(&[event]);
+        let result = self.pointer_mut()?.emit(&[event]);
         if pressed {
             self.pressed_buttons.insert(button);
         } else if result.is_ok() {
@@ -119,7 +147,7 @@ impl Injector for UInputInjector {
 
     fn key(&mut self, code: u16, pressed: bool) -> Result<()> {
         let event = InputEvent::new(EventType::KEY.0, code, if pressed { 1 } else { 0 });
-        let result = self.device_mut()?.emit(&[event]);
+        let result = self.keyboard_mut()?.emit(&[event]);
         if pressed {
             self.pressed_keys.insert(code);
         } else if result.is_ok() {
@@ -142,7 +170,7 @@ impl Injector for UInputInjector {
                 vertical,
             ),
         ];
-        self.device_mut()?.emit(&events)?;
+        self.pointer_mut()?.emit(&events)?;
         Ok(())
     }
 

@@ -9,22 +9,23 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::coords::{ABSOLUTE_MAX, Transform};
+use crate::coords::Transform;
 
 /// (screenshot pixel, ABS coordinate) observation pair.
 pub type Observation = ((f64, f64), (f64, f64));
+/// (observed desktop pixel, ABS coordinate, intended desktop pixel).
+pub type Probe = ((f64, f64), (f64, f64), (f64, f64));
 
 /// Fractions of the ABS range that the pointer is sent to, in order. The
 /// first one is the baseline position; the others are compared against it.
-pub const PROBE_FRACTIONS: [(f64, f64); 4] = [(0.2, 0.2), (0.8, 0.2), (0.5, 0.8), (0.8, 0.7)];
-const DIFF_THRESHOLD: u32 = 40;
+/// Positions inside the sandbox window (fractions of its rectangle) that the
+/// real pointer is sent to during calibration.
+pub const PROBE_FRACTIONS: [(f64, f64); 4] = [(0.2, 0.2), (0.8, 0.25), (0.5, 0.8), (0.75, 0.7)];
+/// Background colour the sandbox compositor paints so its window can be found
+/// in a desktop screenshot.
+pub const SANDBOX_BG: (u8, u8, u8) = (255, 0, 255);
 const MAX_CURSOR_SIZE: u32 = 96;
 const MIN_CURSOR_PIXELS: usize = 12;
-
-pub fn probe_abs(fraction: (f64, f64)) -> (u32, u32) {
-    let scale = |f: f64| (f * f64::from(ABSOLUTE_MAX)).round() as u32;
-    (scale(fraction.0), scale(fraction.1))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Blob {
@@ -89,33 +90,72 @@ impl Image {
     }
 }
 
-/// Connected regions where `a` and `b` differ. Regions larger than a cursor
-/// (window content changing) are dropped.
-pub fn changed_blobs(a: &Image, b: &Image) -> Result<Vec<Blob>> {
-    if a.width != b.width || a.height != b.height {
-        return Err(anyhow!(
-            "screenshots differ in size ({}x{} vs {}x{}); the screen changed during calibration",
-            a.width,
-            a.height,
-            b.width,
-            b.height
-        ));
-    }
-    let (width, height) = (a.width, a.height);
-    let mut mask = vec![false; (width * height) as usize];
-    for y in 0..height {
-        for x in 0..width {
-            let (r1, g1, b1) = a.pixel(x, y);
-            let (r2, g2, b2) = b.pixel(x, y);
-            let diff = u32::from(r1.abs_diff(r2))
-                + u32::from(g1.abs_diff(g2))
-                + u32::from(b1.abs_diff(b2));
-            if diff > DIFF_THRESHOLD {
-                mask[(y * width + x) as usize] = true;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn is_bg(pixel: (u8, u8, u8)) -> bool {
+    let (r, g, b) = pixel;
+    r.abs_diff(SANDBOX_BG.0) < 24 && g.abs_diff(SANDBOX_BG.1) < 24 && b.abs_diff(SANDBOX_BG.2) < 24
+}
+
+/// Bounding box of the sandbox background colour in a desktop screenshot.
+/// Rows and columns must be mostly background so stray pixels do not count.
+pub fn find_sandbox_rect(image: &Image) -> Result<Rect> {
+    let mut rows = vec![0u32; image.height as usize];
+    let mut cols = vec![0u32; image.width as usize];
+    for y in 0..image.height {
+        for x in 0..image.width {
+            if is_bg(image.pixel(x, y)) {
+                rows[y as usize] += 1;
+                cols[x as usize] += 1;
             }
         }
     }
+    let span = |counts: &[u32], min_count: u32| -> Option<(u32, u32)> {
+        let first = counts.iter().position(|&c| c >= min_count)? as u32;
+        let last = counts.iter().rposition(|&c| c >= min_count)? as u32;
+        Some((first, last))
+    };
+    let (x0, x1) = span(&cols, 200)
+        .ok_or_else(|| anyhow!("sandbox window not found in the desktop screenshot"))?;
+    let (y0, y1) = span(&rows, 200)
+        .ok_or_else(|| anyhow!("sandbox window not found in the desktop screenshot"))?;
+    let rect = Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0 + 1,
+        height: y1 - y0 + 1,
+    };
+    if rect.width < 320 || rect.height < 180 {
+        return Err(anyhow!(
+            "sandbox window candidate {rect:?} is too small; is the sandbox window visible and unobstructed?"
+        ));
+    }
+    Ok(rect)
+}
 
+/// Top-left of the largest non-background blob in a sandbox screenshot: the
+/// cursor drawn by the sandbox compositor.
+pub fn find_cursor_on_bg(image: &Image) -> Option<Blob> {
+    let mut mask = vec![false; (image.width * image.height) as usize];
+    for y in 0..image.height {
+        for x in 0..image.width {
+            if !is_bg(image.pixel(x, y)) {
+                mask[(y * image.width + x) as usize] = true;
+            }
+        }
+    }
+    blobs_from_mask(&mask, image.width, image.height)
+        .into_iter()
+        .max_by_key(|blob| blob.pixels)
+}
+
+fn blobs_from_mask(mask: &[bool], width: u32, height: u32) -> Vec<Blob> {
     let mut blobs = Vec::new();
     let mut visited = vec![false; mask.len()];
     let mut stack = Vec::new();
@@ -163,16 +203,7 @@ pub fn changed_blobs(a: &Image, b: &Image) -> Result<Vec<Blob>> {
             blobs.push(blob);
         }
     }
-    Ok(blobs)
-}
-
-/// Pick the blob whose hotspot is closest to `expected`.
-pub fn closest_blob(blobs: &[Blob], expected: (f64, f64)) -> Option<Blob> {
-    blobs.iter().copied().min_by(|a, b| {
-        let da = distance(a.hotspot(), expected);
-        let db = distance(b.hotspot(), expected);
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-    })
+    blobs
 }
 
 fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -300,59 +331,53 @@ pub fn save_calibration(calibration: &Calibration) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Image, changed_blobs, closest_blob, fit_transform, probe_abs};
-    use crate::coords::ABSOLUTE_MAX;
+    use super::{Image, SANDBOX_BG, find_cursor_on_bg, find_sandbox_rect, fit_transform};
 
-    fn blank(width: u32, height: u32) -> Image {
-        Image {
-            width,
-            height,
-            rgb: vec![200; (width * height * 3) as usize],
+    fn filled(width: u32, height: u32, color: (u8, u8, u8)) -> Image {
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for _ in 0..width * height {
+            rgb.extend_from_slice(&[color.0, color.1, color.2]);
         }
+        Image { width, height, rgb }
     }
 
-    fn draw_cursor(image: &mut Image, x: u32, y: u32) {
-        // A 12x18 arrow-ish block whose top-left is the hotspot.
-        for dy in 0..18 {
-            for dx in 0..12 {
-                if dx <= dy {
-                    let i = (((y + dy) * image.width + x + dx) * 3) as usize;
-                    image.rgb[i] = 0;
-                    image.rgb[i + 1] = 0;
-                    image.rgb[i + 2] = 0;
-                }
+    fn paint(image: &mut Image, x0: u32, y0: u32, w: u32, h: u32, color: (u8, u8, u8)) {
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let i = ((y * image.width + x) * 3) as usize;
+                image.rgb[i] = color.0;
+                image.rgb[i + 1] = color.1;
+                image.rgb[i + 2] = color.2;
             }
         }
     }
 
     #[test]
-    fn finds_cursor_blobs_and_hotspots() {
-        let baseline = {
-            let mut image = blank(200, 150);
-            draw_cursor(&mut image, 20, 20);
-            image
-        };
-        let moved = {
-            let mut image = blank(200, 150);
-            draw_cursor(&mut image, 150, 100);
-            image
-        };
-        let blobs = changed_blobs(&baseline, &moved).unwrap();
-        assert_eq!(blobs.len(), 2);
-        let near_new = closest_blob(&blobs, (148.0, 98.0)).unwrap();
-        assert_eq!(near_new.hotspot(), (150.0, 100.0));
-        let near_old = closest_blob(&blobs, (0.0, 0.0)).unwrap();
-        assert_eq!(near_old.hotspot(), (20.0, 20.0));
+    fn finds_sandbox_rectangle_in_desktop_screenshot() {
+        let mut desktop = filled(1000, 700, (30, 30, 30));
+        paint(&mut desktop, 120, 80, 640, 360, SANDBOX_BG);
+        // a stray magenta pixel elsewhere must not stretch the rectangle
+        paint(&mut desktop, 900, 650, 1, 1, SANDBOX_BG);
+        let rect = find_sandbox_rect(&desktop).unwrap();
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (120, 80, 640, 360)
+        );
     }
 
     #[test]
-    fn large_changes_are_not_cursor_blobs() {
-        let baseline = blank(200, 150);
-        let mut changed = blank(200, 150);
-        for i in 0..(200 * 150 * 3) {
-            changed.rgb[i] = 0;
-        }
-        assert!(changed_blobs(&baseline, &changed).unwrap().is_empty());
+    fn rejects_when_no_sandbox_window() {
+        let desktop = filled(1000, 700, (30, 30, 30));
+        assert!(find_sandbox_rect(&desktop).is_err());
+    }
+
+    #[test]
+    fn finds_cursor_hotspot_on_background() {
+        let mut sandbox = filled(640, 360, SANDBOX_BG);
+        paint(&mut sandbox, 200, 100, 12, 18, (0, 0, 0));
+        let cursor = find_cursor_on_bg(&sandbox).unwrap();
+        assert_eq!(cursor.hotspot(), (200.0, 100.0));
+        assert!(find_cursor_on_bg(&filled(64, 64, SANDBOX_BG)).is_none());
     }
 
     #[test]
@@ -378,13 +403,5 @@ mod tests {
             ((20.0, 20.0), (200.0, 200.0)),
         ];
         assert!(fit_transform(&pairs).is_err());
-    }
-
-    #[test]
-    fn probe_positions_stay_inside_abs_range() {
-        for fraction in super::PROBE_FRACTIONS {
-            let (x, y) = probe_abs(fraction);
-            assert!(x <= u32::from(ABSOLUTE_MAX) && y <= u32::from(ABSOLUTE_MAX));
-        }
     }
 }
