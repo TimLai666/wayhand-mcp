@@ -87,6 +87,8 @@ Real uinput and the portal are exercised only in the manual demo on the develope
 | sandbox screenshot 1280x720 | ~165 ms |
 | sandbox click incl. 150 ms settle | ~152 ms |
 | sandbox demo | typed + pasted text verified through wl-paste on the nested display |
+| headless sandbox (default since 2026-09-05) | start ~110-210 ms, screenshot ~20-35 ms empty, click ~2 ms |
+| calibrate with ruler window | 2.7 s, worst deviation 0.70 px (visible ruler 2880x1704 at scale 2) |
 
 ## Hidden assumptions
 

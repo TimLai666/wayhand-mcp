@@ -2,13 +2,15 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     schemars::JsonSchema,
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     calibrate::{self, Calibration},
@@ -16,7 +18,7 @@ use crate::{
     inject::{Button, Injector},
     keys::{Combo, KeyMap, KeyStroke, Modifier, TextRun},
     safety::{Budget, BudgetError, settle_duration},
-    sandbox::Sandbox,
+    sandbox::{Sandbox, SandboxOptions},
     screenshot::{self, CapturedScreenshot},
 };
 
@@ -183,11 +185,27 @@ impl OperationState {
         }
     }
 
-    async fn run_steps(&mut self, target: Target, steps: Vec<Step>) -> Result<(), String> {
+    async fn run_steps(
+        &mut self,
+        target: Target,
+        steps: Vec<Step>,
+        ct: &CancellationToken,
+    ) -> Result<(), String> {
         self.approve_injection().await?;
         let display = self.sandbox_display();
         for step in steps {
             self.ensure_running()?;
+            if ct.is_cancelled() {
+                let cleanup = self
+                    .injector(target)
+                    .and_then(|injector| injector.release_all().map_err(|e| format!("{e:#}")));
+                return Err(match cleanup {
+                    Ok(()) => "cancelled by the client; pressed inputs released".to_owned(),
+                    Err(e) => {
+                        format!("cancelled by the client; releasing pressed inputs failed: {e}")
+                    }
+                });
+            }
             let result = match step {
                 Step::Sleep(duration) => {
                     tokio::time::sleep(duration).await;
@@ -566,6 +584,28 @@ pub struct TypeArgs {
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoArgs {}
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SandboxStartArgs {
+    #[serde(default)]
+    #[schemars(
+        description = "false (default): headless sandbox, nothing is shown on the user's screen and screenshots always work. true: show the sandbox as a window on the real desktop so the user can watch; screenshots then need that window to be visible and uncovered."
+    )]
+    pub visible: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "Sandbox width in pixels (headless only). Default 1920.",
+        range(min = 640, max = 3840)
+    )]
+    pub width: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Sandbox height in pixels (headless only). Default 1080.",
+        range(min = 480, max = 2160)
+    )]
+    pub height: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct LaunchArgs {
@@ -676,13 +716,14 @@ impl DesktopServer {
         button: Button,
         count: u32,
         verb: &str,
+        ct: &CancellationToken,
     ) -> Result<CallToolResult, String> {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let mut operation = self.operation.lock().await;
         let (x, y) = operation.map_point(target, args.x, args.y)?;
         operation
-            .run_steps(target, click_steps(x, y, button, count))
+            .run_steps(target, click_steps(x, y, button, count), ct)
             .await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
@@ -693,12 +734,18 @@ impl DesktopServer {
         )))
     }
 
-    async fn move_action(&self, args: PointArgs) -> Result<CallToolResult, String> {
+    async fn move_action(
+        &self,
+        args: PointArgs,
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let mut operation = self.operation.lock().await;
         let (x, y) = operation.map_point(target, args.x, args.y)?;
-        operation.run_steps(target, vec![Step::Move(x, y)]).await?;
+        operation
+            .run_steps(target, vec![Step::Move(x, y)], ct)
+            .await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
             "moved pointer to {} pixel ({}, {})",
@@ -708,7 +755,11 @@ impl DesktopServer {
         )))
     }
 
-    async fn drag_action(&self, args: DragArgs) -> Result<CallToolResult, String> {
+    async fn drag_action(
+        &self,
+        args: DragArgs,
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let step_px = args.step_px.unwrap_or(20).clamp(1, 500);
@@ -724,7 +775,7 @@ impl DesktopServer {
             path.push(operation.map_point(target, x, y)?);
         }
         let steps = drag_steps(&path, hold);
-        operation.run_steps(target, steps).await?;
+        operation.run_steps(target, steps, ct).await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
             "dragged on {} from ({}, {}) to ({}, {}) through {} waypoint(s)",
@@ -737,7 +788,11 @@ impl DesktopServer {
         )))
     }
 
-    async fn scroll_action(&self, args: ScrollArgs) -> Result<CallToolResult, String> {
+    async fn scroll_action(
+        &self,
+        args: ScrollArgs,
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let dx = args.dx.unwrap_or(0).clamp(-50, 50);
@@ -752,7 +807,7 @@ impl DesktopServer {
             Step::Sleep(Duration::from_millis(20)),
             Step::Scroll(dx, dy),
         ];
-        operation.run_steps(target, steps).await?;
+        operation.run_steps(target, steps, ct).await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
             "scrolled dx={dx} dy={dy} notches at {} pixel ({}, {})",
@@ -762,7 +817,11 @@ impl DesktopServer {
         )))
     }
 
-    async fn key_action(&self, args: KeyArgs) -> Result<CallToolResult, String> {
+    async fn key_action(
+        &self,
+        args: KeyArgs,
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let mut operation = self.operation.lock().await;
@@ -771,7 +830,7 @@ impl DesktopServer {
             .parse_combo(&args.combo)
             .map_err(|error| error.to_string())?;
         let steps = combo_steps(&operation.keymap, &combo)?;
-        operation.run_steps(target, steps).await?;
+        operation.run_steps(target, steps, ct).await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
             "pressed {} on {}",
@@ -780,7 +839,11 @@ impl DesktopServer {
         )))
     }
 
-    async fn type_action(&self, args: TypeArgs) -> Result<CallToolResult, String> {
+    async fn type_action(
+        &self,
+        args: TypeArgs,
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let delay = Duration::from_millis(args.delay_ms.unwrap_or(10).min(1000));
@@ -790,7 +853,7 @@ impl DesktopServer {
         let mut operation = self.operation.lock().await;
         let plan = type_steps(&operation.keymap, &args.text, delay)?;
         let (typed, pasted) = (plan.typed_chars, plan.pasted_chars);
-        operation.run_steps(target, plan.steps).await?;
+        operation.run_steps(target, plan.steps, ct).await?;
         tokio::time::sleep(settle).await;
         let mut message = format!("typed {typed} character(s) on {}", target.name());
         if pasted > 0 {
@@ -801,24 +864,49 @@ impl DesktopServer {
         Ok(text_result(message))
     }
 
-    async fn calibrate_action(&self) -> Result<CallToolResult, String> {
+    async fn calibrate_action(&self, ct: &CancellationToken) -> Result<CallToolResult, String> {
         let mut operation = self.operation.lock().await;
-        if operation.sandbox.is_none() {
+        // A visible sway window on the real desktop serves as the ruler. It is
+        // private to this call so the working sandbox (usually headless) is untouched.
+        let ruler = {
             let keymap = &operation.keymap;
-            let sandbox = tokio::task::block_in_place(|| Sandbox::start(keymap))
-                .map_err(|error| format!("calibrate needs the sandbox window as a measuring target; sandbox_start failed: {error:#}"))?;
-            operation.sandbox = Some(sandbox);
-            operation.screens.remove(&Target::Sandbox);
-            tokio::time::sleep(Duration::from_millis(800)).await;
-        }
+            let options = SandboxOptions {
+                visible: true,
+                ..SandboxOptions::default()
+            };
+            tokio::task::block_in_place(|| Sandbox::start(keymap, options, "ruler")).map_err(|error| {
+                format!("calibrate needs a visible sway window as a ruler; starting it failed: {error:#}")
+            })?
+        };
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let result = self.calibrate_with_ruler(&mut operation, &ruler, ct).await;
+        tokio::task::block_in_place(|| drop(ruler));
+        result
+    }
 
-        let desktop_shot = self.capture(&mut operation, Target::Desktop).await?;
+    async fn calibrate_with_ruler(
+        &self,
+        operation: &mut OperationState,
+        ruler: &Sandbox,
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
+        let ruler_shot = |ruler: &Sandbox| -> Result<CapturedScreenshot, String> {
+            let frame = tokio::task::block_in_place(|| ruler.client().screenshot())
+                .map_err(|error| format!("ruler screenshot failed: {error:#}"))?;
+            Ok(CapturedScreenshot {
+                bytes: frame.png,
+                width: frame.width,
+                height: frame.height,
+                captured_at: String::new(),
+            })
+        };
+        let desktop_shot = self.capture(operation, Target::Desktop).await?;
         let desktop_image = calibrate::Image::from_png(&desktop_shot.bytes)
             .map_err(|error| format!("decode desktop screenshot: {error:#}"))?;
         let rect = calibrate::find_sandbox_rect(&desktop_image).map_err(|error| {
-            format!("{error:#}. The sandbox window must be visible and not covered on the real desktop while calibrate runs.")
+            format!("{error:#}. The ruler window must be visible and not covered on the real desktop while calibrate runs.")
         })?;
-        let sandbox_shot = self.capture(&mut operation, Target::Sandbox).await?;
+        let sandbox_shot = ruler_shot(ruler)?;
         let scale_x = f64::from(rect.width) / f64::from(sandbox_shot.width);
         let scale_y = f64::from(rect.height) / f64::from(sandbox_shot.height);
         let screen = operation.screen(Target::Desktop)?;
@@ -846,11 +934,12 @@ impl DesktopServer {
                         Step::Move(abs.0, abs.1),
                         Step::Sleep(Duration::from_millis(250)),
                     ],
+                    ct,
                 )
                 .await?;
-            let shot = self.capture(&mut operation, Target::Sandbox).await?;
+            let shot = ruler_shot(ruler)?;
             let image = calibrate::Image::from_png(&shot.bytes)
-                .map_err(|error| format!("decode sandbox screenshot: {error:#}"))?;
+                .map_err(|error| format!("decode ruler screenshot: {error:#}"))?;
             let Some(cursor) = calibrate::find_cursor_on_bg(&image) else {
                 return Err(format!(
                     "calibration failed: no cursor visible in the sandbox after moving the real pointer to desktop pixel ({:.0}, {:.0}). Either uinput moves do not reach the compositor or the sandbox window is covered.",
@@ -1019,8 +1108,9 @@ impl DesktopServer {
     async fn move_pointer_tool(
         &self,
         Parameters(args): Parameters<PointArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        wrap(self.move_action(args).await)
+        wrap(self.move_action(args, &ctx.ct).await)
     }
 
     #[tool(
@@ -1030,8 +1120,12 @@ impl DesktopServer {
     async fn click(
         &self,
         Parameters(args): Parameters<PointArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        wrap(self.pointer_action(args, Button::Left, 1, "clicked").await)
+        wrap(
+            self.pointer_action(args, Button::Left, 1, "clicked", &ctx.ct)
+                .await,
+        )
     }
 
     #[tool(
@@ -1041,9 +1135,10 @@ impl DesktopServer {
     async fn double_click(
         &self,
         Parameters(args): Parameters<PointArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         wrap(
-            self.pointer_action(args, Button::Left, 2, "double-clicked")
+            self.pointer_action(args, Button::Left, 2, "double-clicked", &ctx.ct)
                 .await,
         )
     }
@@ -1055,9 +1150,10 @@ impl DesktopServer {
     async fn right_click(
         &self,
         Parameters(args): Parameters<PointArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         wrap(
-            self.pointer_action(args, Button::Right, 1, "right-clicked")
+            self.pointer_action(args, Button::Right, 1, "right-clicked", &ctx.ct)
                 .await,
         )
     }
@@ -1069,8 +1165,9 @@ impl DesktopServer {
     async fn drag(
         &self,
         Parameters(args): Parameters<DragArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        wrap(self.drag_action(args).await)
+        wrap(self.drag_action(args, &ctx.ct).await)
     }
 
     #[tool(
@@ -1080,16 +1177,21 @@ impl DesktopServer {
     async fn scroll(
         &self,
         Parameters(args): Parameters<ScrollArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        wrap(self.scroll_action(args).await)
+        wrap(self.scroll_action(args, &ctx.ct).await)
     }
 
     #[tool(
         name = "key",
         description = "Press a key combination on the focused window, e.g. \"ctrl+shift+t\", \"alt+F4\", \"Return\", \"Escape\", \"ctrl+c\". Modifiers: ctrl, shift, alt, super; the last token is an XKB keysym name. Pure key injection, never a shell. target: \"sandbox\" (default, recommended) or \"desktop\" (real keyboard)."
     )]
-    async fn key(&self, Parameters(args): Parameters<KeyArgs>) -> Result<CallToolResult, McpError> {
-        wrap(self.key_action(args).await)
+    async fn key(
+        &self,
+        Parameters(args): Parameters<KeyArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        wrap(self.key_action(args, &ctx.ct).await)
     }
 
     #[tool(
@@ -1099,43 +1201,64 @@ impl DesktopServer {
     async fn type_text(
         &self,
         Parameters(args): Parameters<TypeArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        wrap(self.type_action(args).await)
+        wrap(self.type_action(args, &ctx.ct).await)
     }
 
     #[tool(
         name = "calibrate",
-        description = "Desktop target only. Verifies the mapping between desktop screenshot pixels and the real pointer, using the sandbox window as a ruler: it starts the sandbox if needed, finds its window in a desktop screenshot, moves the real cursor to 4 positions inside it and reads the cursor back from sandbox screenshots. Reports the worst deviation against the 3 px limit and stores the result. The sandbox window must be visible and uncovered, and the user must not touch the mouse while it runs (about 4 seconds). Not needed for the sandbox target."
+        description = "Desktop target only. Verifies the mapping between desktop screenshot pixels and the real pointer: opens a temporary magenta ruler window on the real desktop, finds it in a desktop screenshot, moves the real cursor to 4 positions inside it and reads the cursor back from the ruler. Reports the worst deviation against the 3 px limit and stores the result. The user must not touch the mouse while it runs (about 4 seconds). Not needed for the sandbox target."
     )]
     async fn calibrate(
         &self,
         Parameters(_args): Parameters<NoArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        wrap(self.calibrate_action().await)
+        wrap(self.calibrate_action(&ctx.ct).await)
     }
 
     #[tool(
         name = "sandbox_start",
-        description = "Start the sandbox desktop: a nested sway compositor that appears as one window on the user's GNOME desktop. Apps launched with sandbox_launch run inside it and are driven without touching the user's real mouse or keyboard; the user can keep working and may move the window to another workspace. Returns the nested WAYLAND_DISPLAY name. Safe to call when already running."
+        description = "Start the sandbox desktop: a private sway compositor. By default it is headless (invisible to the user, 1920x1080); pass visible=true to show it as a window on the real desktop instead. Apps launched with sandbox_launch run inside it and are driven without touching the user's real mouse or keyboard, so the user can keep working. Returns the nested WAYLAND_DISPLAY name. Safe to call when already running."
     )]
     async fn sandbox_start(
         &self,
-        Parameters(_args): Parameters<NoArgs>,
+        Parameters(args): Parameters<SandboxStartArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut operation = self.operation.lock().await;
         if let Some(display) = operation.sandbox_display() {
+            let mode = if operation
+                .sandbox
+                .as_ref()
+                .is_some_and(|s| s.options().visible)
+            {
+                "visible window"
+            } else {
+                "headless"
+            };
             return Ok(text_result(format!(
-                "sandbox already running on WAYLAND_DISPLAY={display}"
+                "sandbox already running ({mode}) on WAYLAND_DISPLAY={display}"
             )));
         }
+        let options = SandboxOptions {
+            visible: args.visible.unwrap_or(false),
+            width: args.width.unwrap_or(1920).clamp(640, 3840),
+            height: args.height.unwrap_or(1080).clamp(480, 2160),
+        };
         let keymap = &operation.keymap;
-        match tokio::task::block_in_place(|| Sandbox::start(keymap)) {
+        match tokio::task::block_in_place(|| Sandbox::start(keymap, options, "sandbox")) {
             Ok(sandbox) => {
                 let display = sandbox.display().to_owned();
                 operation.sandbox = Some(sandbox);
                 operation.screens.remove(&Target::Sandbox);
+                let mode = if options.visible {
+                    "as a window on the real desktop (keep it visible and uncovered while taking screenshots)"
+                } else {
+                    "headless (nothing is displayed; use screenshot to see it)"
+                };
                 Ok(text_result(format!(
-                    "sandbox started on WAYLAND_DISPLAY={display}; launch apps with sandbox_launch, then screenshot with target=sandbox"
+                    "sandbox started {mode} on WAYLAND_DISPLAY={display}; launch apps with sandbox_launch, then screenshot with target=sandbox"
                 )))
             }
             Err(error) => Ok(error_result(format!("sandbox_start failed: {error:#}"))),
@@ -1249,6 +1372,31 @@ mod tests {
         keys::KeyMap,
         safety::Budget,
     };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_request_stops_and_releases() {
+        let mut state = state();
+        state.screens.insert(
+            Target::Desktop,
+            ScreenSize {
+                width: 100,
+                height: 100,
+            },
+        );
+        let ct = CancellationToken::new();
+        ct.cancel();
+        let error = state
+            .run_steps(
+                Target::Desktop,
+                vec![Step::Button(Button::Left, true), Step::Move(1, 1)],
+                &ct,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(state.budget.consecutive_injections(), 0);
+    }
 
     fn state() -> OperationState {
         OperationState {
@@ -1387,7 +1535,11 @@ mod tests {
         let (x, y) = state.map_point(Target::Desktop, 99, 0).unwrap();
         assert_eq!((x, y), (65535, 0));
         state
-            .run_steps(Target::Desktop, vec![Step::Move(x, y), Step::Scroll(0, 3)])
+            .run_steps(
+                Target::Desktop,
+                vec![Step::Move(x, y), Step::Scroll(0, 3)],
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(state.budget.consecutive_injections(), 1);
@@ -1408,6 +1560,7 @@ mod tests {
             .run_steps(
                 Target::Desktop,
                 vec![Step::Button(Button::Left, true), Step::Move(1, 1)],
+                &CancellationToken::new(),
             )
             .await
             .unwrap_err();

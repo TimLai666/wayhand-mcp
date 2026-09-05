@@ -5,7 +5,10 @@
 
 use std::{
     io::Write,
-    os::{fd::AsFd, unix::net::UnixStream},
+    os::{
+        fd::{AsFd, AsRawFd},
+        unix::net::UnixStream,
+    },
     path::Path,
     sync::mpsc,
     thread,
@@ -384,9 +387,8 @@ impl Session {
 
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            self.conn.flush().context("flush screencopy")?;
             self.queue
-                .blocking_dispatch(&mut self.state)
+                .dispatch_pending(&mut self.state)
                 .context("dispatch screencopy events")?;
             let pending = self
                 .state
@@ -399,9 +401,34 @@ impl Session {
             if pending.ready {
                 break;
             }
-            if Instant::now() > deadline {
-                return Err(anyhow!("screencopy timed out after 5 seconds"));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "screencopy timed out after 5 seconds; the sandbox compositor produced no frame (a visible sandbox window that is covered, minimized or on another workspace does not get frames from GNOME; use a headless sandbox)"
+                ));
             }
+            self.conn.flush().context("flush screencopy")?;
+            let Some(guard) = self.queue.prepare_read() else {
+                continue;
+            };
+            let mut pollfd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis() as i32) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow!("poll wayland socket: {error}"));
+            }
+            if ready == 0 {
+                drop(guard);
+                continue;
+            }
+            guard.read().context("read wayland events")?;
         }
         let y_invert = self.state.pending.take().is_some_and(|p| p.y_invert);
         buffer.destroy();

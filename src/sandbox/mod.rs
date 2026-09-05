@@ -20,12 +20,41 @@ use crate::{
 };
 use wl::WlClient;
 
-const SWAY_CONFIG: &str = "default_border none\n\
+/// How the sandbox compositor is run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxOptions {
+    /// Show the sandbox as a window on the real desktop (nested backend).
+    /// Headless is the default: nothing is displayed and frames keep coming
+    /// even when no window is visible.
+    pub visible: bool,
+    /// Output size; only honoured by the headless backend.
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for SandboxOptions {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            width: 1920,
+            height: 1080,
+        }
+    }
+}
+
+fn sway_config(options: SandboxOptions) -> String {
+    format!(
+        "default_border none\n\
 focus_follows_mouse no\n\
+output * mode {}x{}\n\
 output * bg #ff00ff solid_color\n\
-exec sh -c 'printf %s \"$WAYLAND_DISPLAY\" > \"$WAYHAND_SANDBOX_DIR/display\"'\n";
+exec sh -c 'printf %s \"$WAYLAND_DISPLAY\" > \"$WAYHAND_SANDBOX_DIR/display\"'\n",
+        options.width, options.height
+    )
+}
 
 pub struct Sandbox {
+    options: SandboxOptions,
     compositor: Child,
     apps: Vec<Child>,
     display: String,
@@ -37,29 +66,41 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    pub fn start(keymap: &KeyMap) -> Result<Self> {
+    /// `tag` names the runtime directory so two sandboxes (the working one
+    /// and a calibration ruler) never share a display file.
+    pub fn start(keymap: &KeyMap, options: SandboxOptions, tag: &str) -> Result<Self> {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is not set; cannot start the sandbox"))?;
-        if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|value| value.is_empty()) {
+        if options.visible
+            && std::env::var_os("WAYLAND_DISPLAY").is_none_or(|value| value.is_empty())
+        {
             return Err(anyhow!(
                 "WAYLAND_DISPLAY is not set; the sandbox needs a parent Wayland session"
             ));
         }
-        let dir = runtime_dir.join("wayhand-mcp");
+        let dir = runtime_dir.join("wayhand-mcp").join(tag);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create sandbox directory {}", dir.display()))?;
         let display_file = dir.join("display");
         let _ = std::fs::remove_file(&display_file);
         let config_path = dir.join("sway.conf");
-        std::fs::write(&config_path, SWAY_CONFIG)
+        std::fs::write(&config_path, sway_config(options))
             .with_context(|| format!("write sway config {}", config_path.display()))?;
 
-        let mut compositor = Command::new("sway")
+        let mut command = Command::new("sway");
+        command
             .arg("-c")
             .arg(&config_path)
-            .env("WAYHAND_SANDBOX_DIR", &dir)
+            .env("WAYHAND_SANDBOX_DIR", &dir);
+        if !options.visible {
+            command
+                .env("WLR_BACKENDS", "headless")
+                .env("WLR_LIBINPUT_NO_DEVICES", "1")
+                .env_remove("WAYLAND_DISPLAY");
+        }
+        let mut compositor = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -94,6 +135,7 @@ impl Sandbox {
         };
 
         Ok(Self {
+            options,
             compositor,
             apps: Vec::new(),
             display,
@@ -107,6 +149,10 @@ impl Sandbox {
 
     pub fn display(&self) -> &str {
         &self.display
+    }
+
+    pub fn options(&self) -> SandboxOptions {
+        self.options
     }
 
     pub fn client(&self) -> &WlClient {

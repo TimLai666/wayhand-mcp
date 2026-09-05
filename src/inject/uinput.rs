@@ -92,22 +92,42 @@ impl UInputInjector {
         }
     }
 
-    fn unavailable_error(&self) -> anyhow::Error {
-        let reason = self
-            .unavailable_reason
-            .as_deref()
-            .unwrap_or("the virtual device was not initialized");
-        anyhow!("uinput backend unavailable: {reason}")
+    /// Retry opening the devices when an earlier attempt failed, so a server
+    /// started before `/dev/uinput` was writable recovers without a restart.
+    fn ensure_devices(&mut self) -> Result<()> {
+        if self.pointer.is_some() && self.keyboard.is_some() {
+            return Ok(());
+        }
+        match Self::new() {
+            Ok(mut fresh) => {
+                tracing::info!("uinput became available; virtual devices created");
+                self.pointer = fresh.pointer.take();
+                self.keyboard = fresh.keyboard.take();
+                self.unavailable_reason = None;
+                Ok(())
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.unavailable_reason = Some(reason.clone());
+                Err(anyhow!(
+                    "uinput backend unavailable: {reason} (run scripts/setup.sh and scripts/check.sh)"
+                ))
+            }
+        }
     }
 
     fn pointer_mut(&mut self) -> Result<&mut VirtualDevice> {
-        let error = self.unavailable_error();
-        self.pointer.as_mut().ok_or(error)
+        self.ensure_devices()?;
+        self.pointer
+            .as_mut()
+            .ok_or_else(|| anyhow!("uinput pointer device missing"))
     }
 
     fn keyboard_mut(&mut self) -> Result<&mut VirtualDevice> {
-        let error = self.unavailable_error();
-        self.keyboard.as_mut().ok_or(error)
+        self.ensure_devices()?;
+        self.keyboard
+            .as_mut()
+            .ok_or_else(|| anyhow!("uinput keyboard device missing"))
     }
 }
 
@@ -199,6 +219,9 @@ impl Injector for UInputInjector {
 
 impl Drop for UInputInjector {
     fn drop(&mut self) {
+        if self.pointer.is_none() && self.keyboard.is_none() {
+            return;
+        }
         if let Err(error) = self.release_all() {
             tracing::error!(error = %error, "failed to release pressed inputs while dropping uinput injector");
         }

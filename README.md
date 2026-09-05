@@ -13,7 +13,7 @@ Every observation and input tool takes a `target` parameter.
 
 | `target` | What it drives | Effect on you |
 |---|---|---|
-| `sandbox` (default, recommended) | A nested `sway` compositor that appears as one window on your desktop. Apps launched with `sandbox_launch` run inside it and are driven through Wayland virtual-input protocols. | None. Your mouse and keyboard stay yours; you can keep working and move the sandbox window to another workspace. |
+| `sandbox` (default, recommended) | A private `sway` compositor, headless by default (nothing appears on your screen; `sandbox_start {"visible": true}` shows it as a window instead). Apps launched with `sandbox_launch` run inside it and are driven through Wayland virtual-input protocols. | None. Your mouse and keyboard stay yours and you can keep working. |
 | `desktop` | Your real screen through the XDG Screenshot portal, and your real pointer/keyboard through a `/dev/uinput` virtual device. | It takes over the real cursor and keyboard. Do not touch the computer while a desktop-target action runs. |
 
 The sandbox exists because Mutter (GNOME's compositor) has exactly one pointer
@@ -66,7 +66,7 @@ claude mcp add wayhand-mcp -- /absolute/path/to/target/release/wayhand-mcp
 
 | Tool | Purpose |
 |---|---|
-| `sandbox_start` / `sandbox_launch` / `sandbox_stop` | Start the nested sandbox desktop, launch a program inside it (argv array, no shell), stop it and its apps. |
+| `sandbox_start` / `sandbox_launch` / `sandbox_stop` | Start the sandbox desktop (headless 1920×1080 by default, or `visible: true` for a window on the real desktop; `width`/`height` for headless), launch a program inside it (argv array, no shell), stop it and its apps. |
 | `screen_info` | Capture the target and report width, height and the coordinate system. |
 | `screenshot` | Capture the target and return a PNG plus timestamp and size. |
 | `move`, `click`, `double_click`, `right_click` | Pointer actions at `x,y` in screenshot pixels. |
@@ -74,7 +74,7 @@ claude mcp add wayhand-mcp -- /absolute/path/to/target/release/wayhand-mcp
 | `scroll` | Wheel notches at `x,y`; positive `dy` scrolls down. |
 | `key` | Key combo such as `ctrl+shift+t`, `alt+F4`, `Return`. |
 | `type` | Type text; characters outside the US layout are pasted through the clipboard with `ctrl+v`. |
-| `calibrate` | Desktop target only: moves the real cursor to known positions, finds it in screenshots, fits and stores the pixel→pointer transform, reports the worst residual against the 3 px limit. |
+| `calibrate` | Desktop target only: opens a temporary magenta ruler window, moves the real cursor to known positions inside it, reads the cursor back from the ruler, and stores the verified pixel→pointer mapping with the worst deviation against the 3 px limit. |
 
 Coordinates are always pixel positions in the most recent screenshot of the
 same target, origin top-left. Sandbox coordinates map 1:1 onto the virtual
@@ -91,7 +91,8 @@ Typical flow: `sandbox_start` → `sandbox_launch ["gnome-text-editor", "--stand
 - Tools never run a shell. `type` and `key` are pure key injection, and
   `sandbox_launch` executes the argv directly.
 - `Ctrl+C` / `SIGINT` stops all further injection and releases every pressed
-  button and key. Any injection error also releases pressed inputs.
+  button and key. Any injection error, and a cancelled MCP request, also
+  release pressed inputs.
 - A circuit breaker refuses injection after 200 consecutive actions without a
   screenshot; a new screenshot resets it. Actions are serialized through one
   queue with a 20 ms minimum spacing, so calls never interleave.
@@ -106,7 +107,9 @@ Typical flow: `sandbox_start` → `sandbox_launch ["gnome-text-editor", "--stand
 | Item | Value |
 |---|---|
 | Sandbox start (sway nested) | ~210 ms |
-| Sandbox screenshot (1280×720, screencopy → PNG) | ~165 ms |
+| Sandbox screenshot (1280×720 visible window) | ~165 ms |
+| Sandbox screenshot (1920×1080 headless, screencopy → PNG) | ~20-35 ms empty screen, ~165 ms with an app window |
+| Headless sandbox start | ~110-210 ms |
 | Sandbox click including default 150 ms settle | ~152 ms |
 | Desktop screenshot via portal, after permission grant | ~510-670 ms (2880×1800) |
 | Desktop screenshot, first call with permission dialog | ~8.4 s |
@@ -128,8 +131,10 @@ guard. Neither affects the sandbox target or the screenshot portal.
 - The sandbox only controls programs launched inside it through
   `sandbox_launch`. Windows already open on your real desktop need
   `target=desktop`.
-- The sandbox window size is decided by GNOME (1280×720 or the available work
-  area); the requested output mode is ignored by nested sway.
+- A visible sandbox window only receives frames from GNOME while it is on
+  screen and not covered; screenshots of a covered, minimized or
+  other-workspace sandbox window time out after 5 s. The headless sandbox
+  (default) has no such limit. The visible window's size is decided by GNOME.
 - GTK applications that are already running on the real desktop hand new
   launches to the existing instance over D-Bus, which would open the window on
   the real desktop. Pass a flag that forces a new process, for example

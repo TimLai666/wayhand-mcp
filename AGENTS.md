@@ -35,12 +35,12 @@ GNOME 的 Mutter 只有一組游標與鍵盤焦點，注入的輸入一定會搶
 
 | 模式 | `target` 值 | 做法 | 影響使用者 |
 |---|---|---|---|
-| 沙盒桌面（預設、推薦） | `sandbox` | server 在 GNOME 裡啟動一個巢狀的 sway（wlroots）視窗，要操作的程式在裡面啟動。輸入走 `zwlr_virtual_pointer_v1` 與 `zwp_virtual_keyboard_v1`，截圖走 `zwlr_screencopy_v1`，都是對巢狀 compositor 講話 | 不影響，使用者可以繼續用電腦，該視窗可放背景或別的工作區 |
+| 沙盒桌面（預設、推薦） | `sandbox` | server 啟動一個私有的 sway（wlroots），預設 headless 完全不顯示，`visible: true` 才以視窗呈現。要操作的程式在裡面啟動。輸入走 `zwlr_virtual_pointer_v1` 與 `zwp_virtual_keyboard_v1`，截圖走 `zwlr_screencopy_v1`，都是對巢狀 compositor 講話 | 不影響，使用者可以繼續用電腦，該視窗可放背景或別的工作區 |
 | 真實桌面 | `desktop` | 現有做法：uinput 注入、XDG Screenshot portal 截圖 | 搶走真實游標與鍵盤，執行時人不能碰電腦 |
 
 沙盒模式的座標：截圖像素直接對應虛擬指標的絕對座標（`motion_absolute` 帶 x_extent/y_extent 就是截圖寬高），不需要校準。`calibrate` 只有真實桌面模式需要。
 
-沙盒的生命週期由工具管理：`sandbox_start`（大小由 GNOME 決定，實測 1280×720）、`sandbox_launch`（在沙盒內啟動一個程式，參數是 argv 陣列，不經 shell）、`sandbox_stop`。server 結束時要把巢狀 compositor 一起收掉。
+沙盒的生命週期由工具管理：`sandbox_start`（headless 預設 1920×1080 可指定；visible 模式大小由 GNOME 決定，實測 1280×720）、`sandbox_launch`（在沙盒內啟動一個程式，參數是 argv 陣列，不經 shell）、`sandbox_stop`。server 結束時要把巢狀 compositor 一起收掉。
 
 ## MCP 工具清單
 
@@ -113,4 +113,4 @@ cargo run --bin wayhand-mcp  # 以 stdio 啟動 server（給 claude mcp add 用�
 - GNOME portal 截圖不含游標，`calibrate` 改用沙盒視窗（純洋紅背景）當量尺。
 - MCP 取消訊號（request cancellation）沒有傳進工具，取消後進行中的動作會做完。
 - 截圖與座標沒有綁定識別碼，只靠操作佇列序列化。單一呼叫者下沒問題。
-- `sandbox_start` 的視窗大小由 GNOME 決定，無法指定。
+- visible 沙盒視窗被遮住、縮小或在別的工作區時 GNOME 不給畫面，screencopy 會 5 秒逾時；headless 沒這問題，所以 headless 是預設。`calibrate` 自己開臨時的可見量尺視窗（tag `ruler`），不動工作用的沙盒。
