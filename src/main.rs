@@ -6,18 +6,21 @@ use rmcp::ServiceExt;
 mod coords;
 mod inject;
 mod instance_lock;
+mod keys;
 mod safety;
+mod sandbox;
 mod screenshot;
 mod server;
 
 use inject::{Injector, fake::FakeInjector, uinput::UInputInjector};
+use keys::KeyMap;
 use safety::Budget;
 use server::DesktopServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     if unsafe { libc::geteuid() } == 0 {
-        eprintln!("desktop-driver refuses to run as root");
+        eprintln!("wayhand-mcp refuses to run as root");
         std::process::exit(1);
     }
 
@@ -25,7 +28,7 @@ async fn main() -> Result<()> {
         Ok(lock) => lock,
         Err(instance_lock::InstanceLockError::AlreadyHeld(path)) => {
             eprintln!(
-                "desktop-driver is already running; lock held at {}",
+                "wayhand-mcp is already running; lock held at {}",
                 path.display()
             );
             std::process::exit(1);
@@ -38,21 +41,20 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    let skip_wayland_check = env_flag("DESKTOP_DRIVER_SKIP_WAYLAND_CHECK");
+    let skip_wayland_check = env_flag("WAYHAND_SKIP_WAYLAND_CHECK");
     if !skip_wayland_check && std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland") {
-        anyhow::bail!("desktop-driver only supports a Wayland session");
+        anyhow::bail!("wayhand-mcp only supports a Wayland session");
     }
     if skip_wayland_check {
-        tracing::warn!(
-            "DESKTOP_DRIVER_SKIP_WAYLAND_CHECK=1 is enabled; this is for sandbox verification only"
-        );
+        tracing::warn!("WAYHAND_SKIP_WAYLAND_CHECK=1 is enabled; this is for test runs only");
     }
 
     let budget = Arc::new(Budget::new());
+    let keymap = KeyMap::us()?;
 
-    let injector: Box<dyn Injector> = if env_flag("DESKTOP_DRIVER_FAKE_INJECTOR") {
+    let injector: Box<dyn Injector> = if env_flag("WAYHAND_FAKE_INJECTOR") {
         tracing::warn!(
-            "DESKTOP_DRIVER_FAKE_INJECTOR=1 is enabled; this is for sandbox verification only"
+            "WAYHAND_FAKE_INJECTOR=1 is enabled; desktop input is recorded, not injected"
         );
         Box::new(FakeInjector::new())
     } else {
@@ -61,14 +63,14 @@ async fn main() -> Result<()> {
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "uinput is unavailable; input tools will return an error"
+                    "uinput is unavailable; desktop-target input tools will return an error (sandbox target still works)"
                 );
                 UInputInjector::unavailable(error.to_string())
             }
         };
         Box::new(injector)
     };
-    let server = DesktopServer::new(injector, budget);
+    let server = DesktopServer::new(injector, budget, keymap);
     let stop_server = server.clone();
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
@@ -80,8 +82,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    let service = server.serve(rmcp::transport::stdio()).await?;
-    service.waiting().await?;
+    let service = server.clone().serve(rmcp::transport::stdio()).await?;
+    let outcome = service.waiting().await;
+    server.shutdown().await;
+    outcome?;
     Ok(())
 }
 

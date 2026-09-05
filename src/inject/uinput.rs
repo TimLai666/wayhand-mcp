@@ -84,18 +84,17 @@ impl UInputInjector {
 }
 
 impl Injector for UInputInjector {
-    fn move_abs(&mut self, x: u16, y: u16) -> Result<()> {
+    fn move_abs(&mut self, x: u32, y: u32) -> Result<()> {
+        let x = i32::try_from(x).map_err(|_| anyhow!("x coordinate exceeds uinput range"))?;
+        let y = i32::try_from(y).map_err(|_| anyhow!("y coordinate exceeds uinput range"))?;
+        if x > ABSOLUTE_MAX || y > ABSOLUTE_MAX {
+            return Err(anyhow!(
+                "coordinate exceeds uinput range 0..={ABSOLUTE_MAX}"
+            ));
+        }
         let events = [
-            InputEvent::new(
-                EventType::ABSOLUTE.0,
-                AbsoluteAxisCode::ABS_X.0,
-                i32::from(x),
-            ),
-            InputEvent::new(
-                EventType::ABSOLUTE.0,
-                AbsoluteAxisCode::ABS_Y.0,
-                i32::from(y),
-            ),
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, x),
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, y),
         ];
         self.device_mut()?.emit(&events)?;
         Ok(())

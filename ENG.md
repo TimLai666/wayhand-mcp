@@ -4,7 +4,7 @@ _2026-09-04 - eng-architect - wayhand-mcp:main_
 ## Architecture
 
 ```text
-[Claude Code] --stdio JSON-RPC--> [desktop-driver (rmcp ServerHandler)]
+[Claude Code] --stdio JSON-RPC--> [wayhand-mcp (rmcp ServerHandler)]
                                      |
                  +-------------------+--------------------+
                  |                   |                    |
@@ -34,7 +34,7 @@ Trust boundary: everything is local. stdio only, no sockets, no network.
 
 ```text
 target=sandbox (default, recommended in tool descriptions)
-  [desktop-driver] --spawn--> [sway, nested wayland backend, shown as one GNOME window]
+  [wayhand-mcp] --spawn--> [sway, nested wayland backend, shown as one GNOME window]
        |  wayland-client on the nested socket
        |    zwlr_virtual_pointer_v1  -> pointer motion_absolute/button/axis
        |    zwp_virtual_keyboard_v1  -> keys with an xkb keymap
@@ -43,7 +43,7 @@ target=sandbox (default, recommended in tool descriptions)
   Coordinates: screenshot pixels == virtual pointer extent, no calibration.
 
 target=desktop
-  [desktop-driver] --uinput--> Mutter seat (steals the real cursor)
+  [wayhand-mcp] --uinput--> Mutter seat (steals the real cursor)
                    --portal--> org.freedesktop.portal.Screenshot
   Coordinates: screenshot pixels -> ABS 0..=65535 via Transform, calibrate later.
 ```
@@ -63,7 +63,7 @@ Mutter has one seat and no protocol to deliver input to an unfocused window, so 
 | `Injector` trait | the uinput device (`FakeInjector` records events) | tool logic, breaker and ordering are testable without hardware |
 | `coords::Transform` | nothing, pure function | corner, rounding and range tests |
 | `safety::Budget` | time via `with_config` | breaker and stop flag tests |
-| stdio JSON-RPC | none, run the binary with `DESKTOP_DRIVER_FAKE_INJECTOR=1` | proves the MCP contract (initialize, tools/list, tools/call) |
+| stdio JSON-RPC | none, run the binary with `WAYHAND_FAKE_INJECTOR=1` | proves the MCP contract (initialize, tools/list, tools/call) |
 
 Real uinput and the portal are exercised only in the manual demo on the developer's desktop.
 
@@ -83,6 +83,10 @@ Real uinput and the portal are exercised only in the manual demo on the develope
 | portal screenshot, second call | 509 ms |
 | screenshot size | 2880x1800, ~740 KB PNG |
 | portal output path | `~/Pictures/Screenshot.png`, deleted by the server after reading |
+| sandbox start | ~210 ms (2026-09-05) |
+| sandbox screenshot 1280x720 | ~165 ms |
+| sandbox click incl. 150 ms settle | ~152 ms |
+| sandbox demo | typed + pasted text verified through wl-paste on the nested display |
 
 ## Hidden assumptions
 

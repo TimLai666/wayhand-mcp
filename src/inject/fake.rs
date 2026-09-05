@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeEvent {
-    MoveAbs { x: u16, y: u16 },
+    MoveAbs { x: u32, y: u32 },
     Button { button: Button, pressed: bool },
     Key { code: u16, pressed: bool },
     Scroll { horizontal: i32, vertical: i32 },
@@ -18,6 +18,7 @@ pub struct FakeInjector {
     pub pressed_buttons: HashSet<Button>,
     pub pressed_keys: HashSet<u16>,
     fail_next: Option<String>,
+    fail_after: Option<usize>,
 }
 
 impl FakeInjector {
@@ -29,9 +30,21 @@ impl FakeInjector {
         self.fail_next = Some(reason.into());
     }
 
+    /// Let `successes` more calls succeed, then fail the one after them.
+    pub fn fail_after(&mut self, successes: usize) {
+        self.fail_after = Some(successes);
+    }
+
     fn record(&mut self, event: FakeEvent) -> Result<()> {
         self.events.push(event);
         self.events.push(FakeEvent::Syn);
+        if let Some(remaining) = self.fail_after.as_mut() {
+            if *remaining == 0 {
+                self.fail_after = None;
+                return Err(anyhow!("fake injector failure"));
+            }
+            *remaining -= 1;
+        }
         self.fail_next
             .take()
             .map_or(Ok(()), |reason| Err(anyhow!(reason)))
@@ -39,7 +52,7 @@ impl FakeInjector {
 }
 
 impl Injector for FakeInjector {
-    fn move_abs(&mut self, x: u16, y: u16) -> Result<()> {
+    fn move_abs(&mut self, x: u32, y: u32) -> Result<()> {
         self.record(FakeEvent::MoveAbs { x, y })
     }
 

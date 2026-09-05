@@ -14,7 +14,7 @@ pub enum Button {
 
 #[allow(dead_code)]
 pub trait Injector: Send {
-    fn move_abs(&mut self, x: u16, y: u16) -> Result<()>;
+    fn move_abs(&mut self, x: u32, y: u32) -> Result<()>;
     fn button(&mut self, button: Button, pressed: bool) -> Result<()>;
     fn key(&mut self, code: u16, pressed: bool) -> Result<()>;
     fn scroll(&mut self, horizontal: i32, vertical: i32) -> Result<()>;

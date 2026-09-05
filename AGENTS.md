@@ -1,4 +1,4 @@
-# AGENTS.md — wayhand-mcp（desktop-driver）
+# AGENTS.md — wayhand-mcp
 
 本檔是這個專案的操作規範。動手前先讀完。
 
@@ -9,7 +9,7 @@
 
 ## 現況（2026-09-04）
 
-交付順序第 1 步已完成：Cargo 專案、`screen_info`、`screenshot`、`move`、`click`、假 backend 與單元測試。截圖已在真機驗證，真注入還沒。
+交付順序第 1、2 步已完成：全部工具、兩種 target、沙盒模式。沙盒端對端 demo（文字編輯器打字、中文貼上、全選複製、wl-paste 驗證）已在真機通過。真實桌面模式的注入與 `calibrate` 實測還沒，等使用者重新登入帶到 input 群組。
 
 已查證的環境：
 
@@ -25,7 +25,7 @@
 ## 技術選型
 
 - 語言 Rust，MCP 用官方 `rmcp` SDK，只走 stdio transport，不開任何網路埠。
-- 輸入注入用 ydotool。透過長駐的 `ydotoold` socket 呼叫，不要每次操作都重新 fork、重連。
+- 真實桌面模式的輸入注入由 server 直接開 `/dev/uinput` 建一個長駐虛擬裝置（evdev crate），不用 ydotool。
 - 截圖優先用 XDG desktop portal 的 `org.freedesktop.portal.Screenshot`，以 zbus 呼叫。
   GNOME 可能每次都跳授權視窗。實測後若無法免互動連續截圖，改評估 ScreenCast portal 的持續授權 session 或 gnome-remote-desktop，取捨要寫進 README 再決定。
 
@@ -40,7 +40,7 @@ GNOME 的 Mutter 只有一組游標與鍵盤焦點，注入的輸入一定會搶
 
 沙盒模式的座標：截圖像素直接對應虛擬指標的絕對座標（`motion_absolute` 帶 x_extent/y_extent 就是截圖寬高），不需要校準。`calibrate` 只有真實桌面模式需要。
 
-沙盒的生命週期由工具管理：`sandbox_start`（可指定大小，預設 1600×1000）、`sandbox_launch`（在沙盒內啟動一個程式，參數是 argv 陣列，不經 shell）、`sandbox_stop`。server 結束時要把巢狀 compositor 一起收掉。
+沙盒的生命週期由工具管理：`sandbox_start`（大小由 GNOME 決定，實測 1280×720）、`sandbox_launch`（在沙盒內啟動一個程式，參數是 argv 陣列，不經 shell）、`sandbox_stop`。server 結束時要把巢狀 compositor 一起收掉。
 
 ## MCP 工具清單
 
@@ -63,12 +63,12 @@ GNOME 的 Mutter 只有一組游標與鍵盤焦點，注入的輸入一定會搶
 
 ## 前置設定（需要 root）
 
-每一步都做成 setup 腳本，並附可逆的 uninstall：安裝 ydotool、寫 `/dev/uinput` 的 udev rule、把使用者加進對應群組、設 `ydotoold` 的 systemd user service。
+每一步都做成 setup 腳本，並附可逆的 uninstall：寫 `/dev/uinput` 的 udev rule、把使用者加進 input 群組。沙盒模式另外需要 `apt install sway`。
 任何需要 sudo 的步驟都要先徵求使用者同意，不要自己跑。
 
 ## 驗收標準
 
-- `claude mcp add desktop-driver -- <指令>` 註冊後，新 session 看得到全部工具。
+- `claude mcp add wayhand-mcp -- <指令>` 註冊後，新 session 看得到全部工具。
 - 端對端 demo 全程由 MCP 工具完成並附截圖：開啟 GNOME 文字編輯器 → 截圖 → 點進輸入區 → 打字 → 截圖驗證文字出現 → 拖曳選取 → `ctrl+c` → 用 `wl-paste` 驗證剪貼簿。
 - 座標校準誤差小於 3px，截圖到可操作的往返延遲要有實測數字。
 - 單元測試涵蓋座標換算與參數驗證。注入類功能用假 backend 測，真注入只在 demo 跑。
@@ -92,7 +92,7 @@ cargo build
 cargo test
 cargo test <測試名稱>        # 跑單一測試
 cargo clippy --all-targets
-cargo run --bin desktop-driver  # 以 stdio 啟動 server（給 claude mcp add 用）
+cargo run --bin wayhand-mcp  # 以 stdio 啟動 server（給 claude mcp add 用）
 ```
 
 ## 必讀文件
@@ -102,7 +102,7 @@ cargo run --bin desktop-driver  # 以 stdio 啟動 server（給 claude mcp add �
 
 ## 架構重點
 
-- 注入層要抽成 trait（真 backend 走 ydotoold socket，假 backend 給測試用），工具層只依賴 trait。
+- 注入層是 `Injector` trait：uinput、沙盒（Wayland 虛擬輸入）、假 backend 三個實作，工具層只依賴 trait。工具動作先由純函式產生 `Step` 序列再執行，序列本身可單元測試。
 - 座標換算獨立成純函式模組，校準矩陣由 `calibrate` 產生並持久化，所有座標工具都經過它。
 - 截圖層與注入層分開，截圖失敗不影響注入熔斷狀態。
 
