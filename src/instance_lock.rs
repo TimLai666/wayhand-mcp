@@ -16,6 +16,7 @@ pub(crate) enum InstanceLockError {
     Other(anyhow::Error),
 }
 
+#[derive(Debug)]
 pub(crate) struct InstanceLock {
     _file: File,
 }

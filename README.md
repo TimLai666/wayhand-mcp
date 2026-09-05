@@ -124,8 +124,10 @@ Typical flow: `sandbox_start` → `sandbox_launch ["gnome-text-editor", "--stand
 - A circuit breaker refuses injection after 200 consecutive actions without a
   screenshot; a new screenshot resets it. Actions are serialized through one
   queue with a 20 ms minimum spacing, so calls never interleave.
-- Only one server instance runs at a time (advisory lock at
-  `$XDG_RUNTIME_DIR/wayhand-mcp.lock`). The server refuses to run as root.
+- Only one server instance may drive the real desktop at a time (advisory
+  lock at `$XDG_RUNTIME_DIR/wayhand-mcp.lock`, taken when the uinput devices
+  are created); other instances can still use the sandbox target. The server
+  refuses to run as root.
 - Desktop screenshots come from the portal as files under `$HOME`; the server
   reads a regular, user-owned file only (no symlinks, 64 MiB cap) and deletes
   it afterwards.

@@ -111,6 +111,7 @@ cargo run --bin wayhand-mcp  # 以 stdio 啟動 server（給 claude mcp add 用�
 - uinput 權限用 udev `TAG+="uaccess"`（rule 檔編號必須小於 73 才會生效）由 logind 設 ACL，不必重新登入；input 群組只是備用。
 - uinput 指標裝置只能宣告三個滑鼠鍵，宣告 BTN_TOOL_PEN/BTN_TOUCH 會被 udev 判成繪圖板而讓 Mutter 忽略絕對移動，所以鍵盤是另一個裝置。
 - GNOME portal 截圖不含游標，`calibrate` 改用沙盒視窗（純洋紅背景）當量尺。
-- MCP 取消訊號（request cancellation）沒有傳進工具，取消後進行中的動作會做完。
+- 單一實例鎖只在建立 uinput 裝置時取得（desktop 模式），多個 Claude／Codex session 可以各自用沙盒；`claude mcp list` 的健康檢查也不會被鎖擋掉。
+- 發 release：更新 Cargo.toml 版本 → `cargo build --release` → 打包 `wayhand-mcp-vX.Y.Z-x86_64-linux.tar.gz`（binary、scripts/、README、LICENSE）與 `.sha256` → `git tag` → `gh release create`。安裝端 `scripts/install.sh` 靠 GitHub API 找最新 tag。
 - 截圖與座標沒有綁定識別碼，只靠操作佇列序列化。單一呼叫者下沒問題。
 - visible 沙盒視窗被遮住、縮小或在別的工作區時 GNOME 不給畫面，screencopy 會 5 秒逾時；headless 沒這問題，所以 headless 是預設。`calibrate` 自己開臨時的可見量尺視窗（tag `ruler`），不動工作用的沙盒。

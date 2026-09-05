@@ -210,6 +210,8 @@ impl Sandbox {
         let _ = self.compositor.kill();
         let _ = self.compositor.wait();
         let _ = std::fs::remove_file(self.dir.join("display"));
+        let _ = std::fs::remove_file(self.dir.join("sway.conf"));
+        let _ = std::fs::remove_dir(&self.dir);
     }
 }
 

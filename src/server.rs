@@ -874,7 +874,7 @@ impl DesktopServer {
                 visible: true,
                 ..SandboxOptions::default()
             };
-            tokio::task::block_in_place(|| Sandbox::start(keymap, options, "ruler")).map_err(|error| {
+            tokio::task::block_in_place(|| Sandbox::start(keymap, options, &format!("ruler-{}", std::process::id()))).map_err(|error| {
                 format!("calibrate needs a visible sway window as a ruler; starting it failed: {error:#}")
             })?
         };
@@ -1247,7 +1247,9 @@ impl DesktopServer {
             height: args.height.unwrap_or(1080).clamp(480, 2160),
         };
         let keymap = &operation.keymap;
-        match tokio::task::block_in_place(|| Sandbox::start(keymap, options, "sandbox")) {
+        match tokio::task::block_in_place(|| {
+            Sandbox::start(keymap, options, &format!("sandbox-{}", std::process::id()))
+        }) {
             Ok(sandbox) => {
                 let display = sandbox.display().to_owned();
                 operation.sandbox = Some(sandbox);

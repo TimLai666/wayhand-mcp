@@ -18,6 +18,9 @@ const KEYBOARD_KEY_MAX: u16 = 0xff;
 
 #[derive(Debug)]
 pub struct UInputInjector {
+    /// Held while this process owns the real-desktop devices, so two servers
+    /// never drive the real pointer at once. Sandbox use needs no lock.
+    _lock: Option<crate::instance_lock::InstanceLock>,
     /// Absolute pointer shaped like a QEMU usb-tablet: ABS_X/ABS_Y, three
     /// mouse buttons and wheel axes. libinput treats it as an absolute mouse.
     pointer: Option<VirtualDevice>,
@@ -29,6 +32,16 @@ pub struct UInputInjector {
 
 impl UInputInjector {
     pub fn new() -> Result<Self> {
+        let lock = match crate::instance_lock::InstanceLock::acquire() {
+            Ok(lock) => lock,
+            Err(crate::instance_lock::InstanceLockError::AlreadyHeld(path)) => {
+                return Err(anyhow!(
+                    "another wayhand-mcp instance is already driving the real desktop (lock {}); use target=sandbox here or stop the other session",
+                    path.display()
+                ));
+            }
+            Err(crate::instance_lock::InstanceLockError::Other(error)) => return Err(error),
+        };
         let mut buttons = AttributeSet::<KeyCode>::new();
         buttons.insert(KeyCode::BTN_LEFT);
         buttons.insert(KeyCode::BTN_RIGHT);
@@ -74,6 +87,7 @@ impl UInputInjector {
             .context("create uinput keyboard device")?;
 
         Ok(Self {
+            _lock: Some(lock),
             pointer: Some(pointer),
             keyboard: Some(keyboard),
             unavailable_reason: None,
@@ -84,6 +98,7 @@ impl UInputInjector {
 
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
+            _lock: None,
             pointer: None,
             keyboard: None,
             unavailable_reason: Some(reason.into()),
@@ -103,6 +118,7 @@ impl UInputInjector {
                 tracing::info!("uinput became available; virtual devices created");
                 self.pointer = fresh.pointer.take();
                 self.keyboard = fresh.keyboard.take();
+                self._lock = fresh._lock.take();
                 self.unavailable_reason = None;
                 Ok(())
             }

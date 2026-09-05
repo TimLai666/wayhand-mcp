@@ -20,22 +20,29 @@ use server::DesktopServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(flag) = std::env::args().nth(1) {
+        match flag.as_str() {
+            "--version" | "-V" => {
+                println!("wayhand-mcp {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!(
+                    "wayhand-mcp {}\nMCP server for GNOME Wayland desktop automation. Speaks MCP over stdio; register it with `claude mcp add wayhand-mcp -- <path>` or `codex mcp add wayhand-mcp -- <path>`.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("unknown argument {other:?}; wayhand-mcp takes no arguments");
+                std::process::exit(2);
+            }
+        }
+    }
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("wayhand-mcp refuses to run as root");
         std::process::exit(1);
     }
-
-    let _instance_lock = match instance_lock::InstanceLock::acquire() {
-        Ok(lock) => lock,
-        Err(instance_lock::InstanceLockError::AlreadyHeld(path)) => {
-            eprintln!(
-                "wayhand-mcp is already running; lock held at {}",
-                path.display()
-            );
-            std::process::exit(1);
-        }
-        Err(instance_lock::InstanceLockError::Other(error)) => return Err(error),
-    };
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
