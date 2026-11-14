@@ -114,20 +114,41 @@ echo "[4/5] 預先授權桌面截圖"
 "$INSTALL_ROOT/scripts/grant-screenshot.sh" >/dev/null && echo "      完成" || echo "      失敗（沒有 portal 授權儲存區？），第一次截圖會跳一次授權視窗"
 
 echo "[5/5] 註冊 MCP server"
+# 已經註冊且指向同一個 binary 就不動設定檔；升級只換 binary。
+claude_already_registered() {
+  command -v python3 >/dev/null || return 1
+  python3 - "$INSTALL_ROOT/wayhand-mcp" <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    with open(os.path.expanduser("~/.claude.json")) as f:
+        cfg = json.load(f)
+except (OSError, ValueError):
+    sys.exit(1)
+entry = cfg.get("mcpServers", {}).get("wayhand-mcp", {})
+sys.exit(0 if entry.get("command") == sys.argv[1] and not entry.get("args") else 1)
+PY
+}
+codex_already_registered() {
+  codex mcp get wayhand-mcp 2>/dev/null | grep -qx "  command: $INSTALL_ROOT/wayhand-mcp"
+}
 if [[ -n "$REGISTER_CLAUDE" ]]; then
-  if command -v claude >/dev/null; then
+  if ! command -v claude >/dev/null; then
+    echo "      找不到 claude 指令，略過 Claude Code"
+  elif claude_already_registered; then
+    echo "      Claude Code 已註冊同一路徑，略過"
+  else
     claude mcp remove wayhand-mcp --scope user >/dev/null 2>&1 || true
     claude mcp add wayhand-mcp --scope user -- "$INSTALL_ROOT/wayhand-mcp"
-  else
-    echo "      找不到 claude 指令，略過 Claude Code"
   fi
 fi
 if [[ -n "$REGISTER_CODEX" ]]; then
-  if command -v codex >/dev/null; then
+  if ! command -v codex >/dev/null; then
+    echo "      找不到 codex 指令，略過 Codex"
+  elif codex_already_registered; then
+    echo "      Codex 已註冊同一路徑，略過"
+  else
     codex mcp remove wayhand-mcp >/dev/null 2>&1 || true
     codex mcp add wayhand-mcp -- "$INSTALL_ROOT/wayhand-mcp"
-  else
-    echo "      找不到 codex 指令，略過 Codex"
   fi
 fi
 
