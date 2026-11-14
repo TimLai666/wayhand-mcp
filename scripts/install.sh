@@ -85,10 +85,12 @@ chmod +x "$INSTALL_ROOT"/scripts/*.sh
 ln -sf "$INSTALL_ROOT/wayhand-mcp" "$BIN_DIR/wayhand-mcp"
 echo "      安裝到 $INSTALL_ROOT，指令連結 $BIN_DIR/wayhand-mcp"
 
-echo "[2/5] 系統套件（sway 給沙盒模式用、wl-clipboard 給中文貼上用）"
+echo "[2/5] 系統套件（sway 給沙盒模式用、wl-clipboard 給中文貼上用、dbus 與 at-spi2-core 給無障礙樹用）"
 MISSING=()
 command -v sway >/dev/null || MISSING+=(sway)
 command -v wl-copy >/dev/null || MISSING+=(wl-clipboard)
+{ command -v dbus-daemon >/dev/null && command -v dbus-send >/dev/null; } || MISSING+=(dbus)
+[ -x /usr/libexec/at-spi2-registryd ] || MISSING+=(at-spi2-core)
 if (( ${#MISSING[@]} )); then
   if (( SKIP_SUDO )); then
     echo "      跳過（--skip-sudo）。之後請自行：sudo apt install ${MISSING[*]}"

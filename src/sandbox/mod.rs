@@ -6,7 +6,7 @@
 pub mod wl;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -53,6 +53,141 @@ exec sh -c 'printf %s \"$WAYLAND_DISPLAY\" > \"$WAYHAND_SANDBOX_DIR/display\"'\n
     )
 }
 
+/// A private AT-SPI bus for the sandbox: its own `dbus-daemon` with the
+/// accessibility bus config plus `at-spi2-registryd`. Apps launched in the
+/// sandbox get `AT_SPI_BUS_ADDRESS` pointing here, so the user's screen
+/// reader never sees them and the tree is readable even when the session's
+/// own accessibility bus is broken.
+struct A11yBus {
+    address: String,
+    daemon: Child,
+    registry: Child,
+}
+
+impl A11yBus {
+    fn start(dir: &std::path::Path) -> Result<Self> {
+        let socket = dir.join("a11y");
+        let _ = std::fs::remove_file(&socket);
+        let mut daemon = Command::new("dbus-daemon")
+            .arg("--config-file=/usr/share/defaults/at-spi2/accessibility.conf")
+            .arg("--nofork")
+            .arg("--print-address")
+            .arg(format!("--address=unix:path={}", socket.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("start dbus-daemon for the sandbox accessibility bus (package dbus)")?;
+        let stdout = daemon.stdout.take().context("dbus-daemon stdout")?;
+        let stderr = daemon.stderr.take().context("dbus-daemon stderr")?;
+        // The pipe read blocks, so it runs on a helper thread and the deadline
+        // is enforced here; a daemon that neither prints nor exits is killed.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout).read_line(&mut line);
+            let _ = sender.send(result.map(|_| line));
+        });
+        let address = match receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(line)) if !line.trim().is_empty() => line.trim().to_owned(),
+            Ok(Ok(_)) => {
+                return Err(anyhow!(
+                    "dbus-daemon exited before printing its address: {}",
+                    stop_child(&mut daemon, stderr)
+                ));
+            }
+            Ok(Err(error)) => {
+                let detail = stop_child(&mut daemon, stderr);
+                return Err(anyhow!("read dbus-daemon address: {error}; {detail}"));
+            }
+            Err(_) => {
+                let detail = stop_child(&mut daemon, stderr);
+                return Err(anyhow!(
+                    "dbus-daemon did not print its address within 5 seconds; {detail}"
+                ));
+            }
+        };
+        let registry = match Command::new("/usr/libexec/at-spi2-registryd")
+            .env("AT_SPI_BUS_ADDRESS", &address)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+                return Err(error).context("start at-spi2-registryd (package at-spi2-core)");
+            }
+        };
+        let mut bus = Self {
+            address,
+            daemon,
+            registry,
+        };
+        // Apps register through org.a11y.atspi.Registry; one launched before
+        // the registry owns that name never shows up, so wait for it. Dropping
+        // `bus` on the error paths kills and reaps both daemons.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !bus.registry_ready() {
+            if let Some(status) = bus.registry.try_wait().ok().flatten() {
+                return Err(anyhow!("at-spi2-registryd exited with {status}"));
+            }
+            if Instant::now() > deadline {
+                return Err(anyhow!(
+                    "at-spi2-registryd did not own org.a11y.atspi.Registry within 5 seconds"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(bus)
+    }
+
+    fn registry_ready(&self) -> bool {
+        Command::new("dbus-send")
+            .arg(format!("--bus={}", self.address))
+            .arg("--print-reply")
+            .arg("--dest=org.freedesktop.DBus")
+            .arg("/org/freedesktop/DBus")
+            .arg("--reply-timeout=2000")
+            .arg("org.freedesktop.DBus.NameHasOwner")
+            .arg("string:org.a11y.atspi.Registry")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("boolean true")
+            })
+    }
+}
+
+impl Drop for A11yBus {
+    fn drop(&mut self) {
+        let _ = self.registry.kill();
+        let _ = self.registry.wait();
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
+/// Kill and reap a child, returning the first line of its stderr for the error.
+fn stop_child(child: &mut Child, stderr: std::process::ChildStderr) -> String {
+    use std::io::BufRead as _;
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut line = String::new();
+    let _ = std::io::BufReader::new(stderr).read_line(&mut line);
+    let line = line.trim();
+    if line.is_empty() {
+        "no stderr output".to_owned()
+    } else {
+        format!("stderr: {line}")
+    }
+}
+
 pub struct Sandbox {
     options: SandboxOptions,
     compositor: Child,
@@ -60,6 +195,9 @@ pub struct Sandbox {
     display: String,
     dir: PathBuf,
     client: WlClient,
+    /// None when the bus could not be started; `a11y_error` says why.
+    a11y: Option<A11yBus>,
+    a11y_error: Option<String>,
     pressed_buttons: HashSet<Button>,
     pressed_keys: HashSet<u16>,
     modifiers: u32,
@@ -89,11 +227,14 @@ impl Sandbox {
         std::fs::write(&config_path, sway_config(options))
             .with_context(|| format!("write sway config {}", config_path.display()))?;
 
+        let sway_socket = dir.join("sway.sock");
+        let _ = std::fs::remove_file(&sway_socket);
         let mut command = Command::new("sway");
         command
             .arg("-c")
             .arg(&config_path)
-            .env("WAYHAND_SANDBOX_DIR", &dir);
+            .env("WAYHAND_SANDBOX_DIR", &dir)
+            .env("SWAYSOCK", &sway_socket);
         if !options.visible {
             command
                 .env("WLR_BACKENDS", "headless")
@@ -134,6 +275,14 @@ impl Sandbox {
             }
         };
 
+        let (a11y, a11y_error) = match A11yBus::start(&dir) {
+            Ok(bus) => (Some(bus), None),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "sandbox accessibility bus unavailable");
+                (None, Some(format!("{error:#}")))
+            }
+        };
+
         Ok(Self {
             options,
             compositor,
@@ -141,6 +290,8 @@ impl Sandbox {
             display,
             dir,
             client,
+            a11y,
+            a11y_error,
             pressed_buttons: HashSet::new(),
             pressed_keys: HashSet::new(),
             modifiers: 0,
@@ -159,11 +310,47 @@ impl Sandbox {
         &self.client
     }
 
+    /// D-Bus address of the sandbox's private accessibility bus, or the
+    /// reason it is not available.
+    pub fn a11y_address(&self) -> Result<&str, String> {
+        match (&self.a11y, &self.a11y_error) {
+            (Some(bus), _) => Ok(&bus.address),
+            (None, Some(error)) => {
+                Err(format!("sandbox accessibility bus is not running: {error}"))
+            }
+            (None, None) => Err("sandbox accessibility bus is not running".to_owned()),
+        }
+    }
+
+    /// Each sandbox window's title and client area in output pixels, keyed
+    /// by pid, read from sway IPC (bounded to 5 s by coreutils `timeout`).
+    pub fn windows(&self) -> Result<HashMap<u32, Vec<crate::a11y::SwayWindow>>> {
+        let output = Command::new("timeout")
+            .arg("5")
+            .arg("swaymsg")
+            .arg("-s")
+            .arg(self.dir.join("sway.sock"))
+            .arg("-t")
+            .arg("get_tree")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .context("run swaymsg -t get_tree")?;
+        if !output.status.success() {
+            return Err(anyhow!("swaymsg -t get_tree exited with {}", output.status));
+        }
+        crate::a11y::sway_windows(&String::from_utf8_lossy(&output.stdout))
+            .map_err(|error| anyhow!(error))
+    }
+
     pub fn launch(&mut self, argv: &[String], cwd: Option<&str>) -> Result<u32> {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| anyhow!("argv must contain at least the program"))?;
         let mut command = Command::new(program);
+        if let Some(bus) = &self.a11y {
+            command.env("AT_SPI_BUS_ADDRESS", &bus.address);
+        }
         command
             .args(args)
             .env("WAYLAND_DISPLAY", &self.display)
@@ -196,6 +383,9 @@ impl Sandbox {
             let _ = app.kill();
             let _ = app.wait();
         }
+        self.a11y = None;
+        let _ = std::fs::remove_file(self.dir.join("a11y"));
+        let _ = std::fs::remove_file(self.dir.join("sway.sock"));
         let pid = self.compositor.id();
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);

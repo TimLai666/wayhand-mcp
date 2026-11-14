@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    a11y::{self, Snapshot, SnapshotOptions},
     calibrate::{self, Calibration},
     coords::Transform,
     inject::{Button, Injector},
@@ -78,9 +79,79 @@ struct OperationState {
     screens: HashMap<Target, ScreenSize>,
     calibration: Option<Calibration>,
     stop_release_done: bool,
+    /// Accessibility bus connections, made on first use. The sandbox entry is
+    /// dropped with the sandbox.
+    buses: HashMap<Target, a11y::Bus>,
+    /// Most recent snapshot per target; refs are valid only against it.
+    snapshots: HashMap<Target, Snapshot>,
+    next_snapshot_id: u32,
 }
 
 impl OperationState {
+    async fn bus(&mut self, target: Target) -> Result<&a11y::Bus, String> {
+        if !self.buses.contains_key(&target) {
+            let bus = match target {
+                Target::Sandbox => {
+                    let address = self
+                        .sandbox
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "sandbox is not running; call sandbox_start first".to_owned()
+                        })?
+                        .a11y_address()?
+                        .to_owned();
+                    a11y::Bus::connect_address(&address).await
+                }
+                Target::Desktop => a11y::Bus::connect_session().await,
+            }
+            .map_err(|error| format!("accessibility bus ({}): {error:#}", target.name()))?;
+            self.buses.insert(target, bus);
+        }
+        Ok(&self.buses[&target])
+    }
+
+    fn drop_sandbox(&mut self) {
+        tokio::task::block_in_place(|| self.sandbox = None);
+        self.screens.remove(&Target::Sandbox);
+        self.buses.remove(&Target::Sandbox);
+        self.snapshots.remove(&Target::Sandbox);
+    }
+
+    /// Centre of a ref's node in screenshot pixels of `target`.
+    fn ref_center(&self, target: Target, text: &str) -> Result<(i64, i64), String> {
+        let node = a11y::resolve_ref(self.snapshots.get(&target), text, target.name())?;
+        let rect = node.rect.ok_or_else(|| {
+            format!(
+                "{text} ({} \"{}\") has no known screen position on the {} target; use activate with the ref, or give x,y from a screenshot",
+                node.role,
+                node.name,
+                target.name()
+            )
+        })?;
+        Ok(a11y::center(rect))
+    }
+
+    /// Pick the pixel point of a tool call: exactly one of (x,y) or ref.
+    fn resolve_point(
+        &self,
+        target: Target,
+        x: Option<i64>,
+        y: Option<i64>,
+        r#ref: Option<&str>,
+    ) -> Result<(i64, i64), String> {
+        match (x, y, r#ref) {
+            (Some(x), Some(y), None) => Ok((x, y)),
+            (None, None, Some(r)) => self.ref_center(target, r),
+            (None, None, None) => {
+                Err("give x and y (screenshot pixels) or ref (from snapshot)".to_owned())
+            }
+            (Some(_), Some(_), Some(_)) => {
+                Err("x,y and ref are both given; pass one of them".to_owned())
+            }
+            _ => Err("x and y must be given together".to_owned()),
+        }
+    }
+
     fn stop(&mut self) {
         self.budget.stop();
         if let Err(error) = self.release_on_stop() {
@@ -455,14 +526,21 @@ pub struct ObservationArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PointArgs {
+    #[serde(default)]
     #[schemars(
-        description = "Horizontal pixel coordinate in the most recent screenshot of the target, origin top-left."
+        description = "Horizontal pixel coordinate in the most recent screenshot of the target, origin top-left. Give x and y, or ref."
     )]
-    pub x: i64,
+    pub x: Option<i64>,
+    #[serde(default)]
     #[schemars(
-        description = "Vertical pixel coordinate in the most recent screenshot of the target, origin top-left."
+        description = "Vertical pixel coordinate in the most recent screenshot of the target, origin top-left. Give x and y, or ref."
     )]
-    pub y: i64,
+    pub y: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Element ref from the most recent snapshot of the same target (e.g. \"s3:e12\"): the pointer acts at the element's centre. Sandbox only; on the desktop target positions are unknown, use activate or x,y."
+    )]
+    pub r#ref: Option<String>,
     #[serde(default = "target_default")]
     #[schemars(description = "\"sandbox\" (default, recommended) or \"desktop\".")]
     pub target: Option<Target>,
@@ -517,10 +595,21 @@ pub struct DragArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ScrollArgs {
-    #[schemars(description = "Horizontal pixel coordinate to scroll at, in screenshot pixels.")]
-    pub x: i64,
-    #[schemars(description = "Vertical pixel coordinate to scroll at, in screenshot pixels.")]
-    pub y: i64,
+    #[serde(default)]
+    #[schemars(
+        description = "Horizontal pixel coordinate to scroll at, in screenshot pixels. Give x and y, or ref."
+    )]
+    pub x: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Vertical pixel coordinate to scroll at, in screenshot pixels. Give x and y, or ref."
+    )]
+    pub y: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Element ref from the most recent snapshot of the same target: scroll with the pointer over the element's centre. Sandbox only."
+    )]
+    pub r#ref: Option<String>,
     #[serde(default)]
     #[schemars(description = "Wheel notches to the right (negative = left). Default 0.", range(min = -50, max = 50))]
     pub dx: Option<i32>,
@@ -565,6 +654,11 @@ pub struct TypeArgs {
     pub text: String,
     #[serde(default)]
     #[schemars(
+        description = "Element ref from the most recent snapshot of the same target: focus that element through the accessibility tree before typing. Works on both targets."
+    )]
+    pub r#ref: Option<String>,
+    #[serde(default)]
+    #[schemars(
         description = "Milliseconds between typed characters. Default 10.",
         range(min = 0, max = 1000)
     )]
@@ -583,6 +677,53 @@ pub struct TypeArgs {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoArgs {}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SnapshotArgs {
+    #[serde(default = "target_default")]
+    #[schemars(description = "\"sandbox\" (default, recommended) or \"desktop\".")]
+    pub target: Option<Target>,
+    #[serde(default)]
+    #[schemars(
+        description = "Only apps whose name contains this text (case-insensitive), e.g. \"text-editor\". Default: every app on the bus."
+    )]
+    pub app: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "true (default): only interactive elements (buttons, text fields, menu items, links, tabs...) and their windows. false: every visible element, including labels and panels; use it to read static text."
+    )]
+    pub interactive: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "Maximum elements returned. Default 300; valid range 1 through 2000.",
+        range(min = 1, max = 2000)
+    )]
+    pub max_nodes: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ActivateArgs {
+    #[schemars(
+        description = "Element ref from the most recent snapshot of the same target, e.g. \"s3:e12\"."
+    )]
+    pub r#ref: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Action name as listed for the element in the snapshot (case-insensitive, e.g. \"Click\"). Default: the first plain action (Click, Press, Toggle, Activate...)."
+    )]
+    pub action: Option<String>,
+    #[serde(default = "target_default")]
+    #[schemars(description = "\"sandbox\" (default, recommended) or \"desktop\".")]
+    pub target: Option<Target>,
+    #[serde(default)]
+    #[schemars(
+        description = "Milliseconds to wait after the action so the UI can settle. Defaults to 150; valid range is 0 through 10000.",
+        range(min = 0, max = 10000)
+    )]
+    pub settle_ms: Option<i64>,
+}
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -659,6 +800,9 @@ impl DesktopServer {
                 screens: HashMap::new(),
                 calibration: calibrate::load_calibration(),
                 stop_release_done: false,
+                buses: HashMap::new(),
+                snapshots: HashMap::new(),
+                next_snapshot_id: 1,
             })),
             tool_router: Self::tool_router(),
         }
@@ -671,7 +815,82 @@ impl DesktopServer {
     pub(crate) async fn shutdown(&self) {
         let mut operation = self.operation.lock().await;
         let _ = operation.release_everything();
-        operation.sandbox = None;
+        operation.drop_sandbox();
+    }
+
+    async fn snapshot_action(&self, args: SnapshotArgs) -> Result<CallToolResult, String> {
+        let target = args.target.unwrap_or_default();
+        let options = SnapshotOptions {
+            interactive_only: args.interactive.unwrap_or(true),
+            max_nodes: args
+                .max_nodes
+                .map(|n| n.clamp(1, 2000))
+                .map_or(a11y::DEFAULT_MAX_NODES, |n| n as usize),
+            app: args.app.filter(|app| !app.trim().is_empty()),
+        };
+        let mut operation = self.operation.lock().await;
+        let offsets = match target {
+            Target::Sandbox => {
+                let sandbox = operation
+                    .sandbox
+                    .as_ref()
+                    .ok_or_else(|| "sandbox is not running; call sandbox_start first".to_owned())?;
+                Some(
+                    tokio::task::block_in_place(|| sandbox.windows())
+                        .map_err(|error| format!("sandbox window positions: {error:#}"))?,
+                )
+            }
+            Target::Desktop => None,
+        };
+        let bus = operation.bus(target).await?;
+        let walked = bus.walk(&options, offsets.as_ref()).await;
+        let (apps, nodes, walk_truncated) = match walked {
+            Ok(result) => result,
+            Err(error) => {
+                // A dead connection must not stay cached; the next call reconnects.
+                operation.buses.remove(&target);
+                return Err(format!("snapshot failed: {error:#}"));
+            }
+        };
+        let (nodes, filter_truncated) = a11y::filter_nodes(&apps, nodes, &options);
+        let id = operation.next_snapshot_id;
+        operation.next_snapshot_id += 1;
+        let snapshot = Snapshot {
+            id,
+            apps,
+            nodes,
+            truncated: walk_truncated || filter_truncated,
+        };
+        let text = a11y::format_snapshot(&snapshot, target.name(), &options);
+        operation.snapshots.insert(target, snapshot);
+        Ok(text_result(text))
+    }
+
+    async fn activate_action(&self, args: ActivateArgs) -> Result<CallToolResult, String> {
+        let target = args.target.unwrap_or_default();
+        let settle = settle_duration(args.settle_ms)?;
+        let mut operation = self.operation.lock().await;
+        let node = a11y::resolve_ref(operation.snapshots.get(&target), &args.r#ref, target.name())?
+            .clone();
+        operation.approve_injection().await?;
+        let bus = operation.bus(target).await?;
+        let performed = match bus
+            .do_action(&node.handle, &node.actions, args.action.as_deref())
+            .await
+        {
+            Ok(performed) => performed,
+            Err(error) => {
+                operation.buses.remove(&target);
+                return Err(format!("activate {} failed: {error:#}", args.r#ref));
+            }
+        };
+        operation.budget.injection_succeeded();
+        drop(operation);
+        tokio::time::sleep(settle).await;
+        Ok(text_result(format!(
+            "performed {performed} on {} ({} \"{}\"); refs from this snapshot may be stale now, take a screenshot or a new snapshot to verify",
+            args.r#ref, node.role, node.name
+        )))
     }
 
     async fn capture(
@@ -721,16 +940,18 @@ impl DesktopServer {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let mut operation = self.operation.lock().await;
-        let (x, y) = operation.map_point(target, args.x, args.y)?;
+        let (px, py) = operation.resolve_point(target, args.x, args.y, args.r#ref.as_deref())?;
+        let (x, y) = operation.map_point(target, px, py)?;
         operation
             .run_steps(target, click_steps(x, y, button, count), ct)
             .await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
-            "{verb} at {} pixel ({}, {})",
+            "{verb} at {} pixel ({px}, {py}){}",
             target.name(),
-            args.x,
-            args.y
+            args.r#ref
+                .map(|r| format!(" (centre of {r})"))
+                .unwrap_or_default()
         )))
     }
 
@@ -742,16 +963,15 @@ impl DesktopServer {
         let target = args.target.unwrap_or_default();
         let settle = settle_duration(args.settle_ms)?;
         let mut operation = self.operation.lock().await;
-        let (x, y) = operation.map_point(target, args.x, args.y)?;
+        let (px, py) = operation.resolve_point(target, args.x, args.y, args.r#ref.as_deref())?;
+        let (x, y) = operation.map_point(target, px, py)?;
         operation
             .run_steps(target, vec![Step::Move(x, y)], ct)
             .await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
-            "moved pointer to {} pixel ({}, {})",
-            target.name(),
-            args.x,
-            args.y
+            "moved pointer to {} pixel ({px}, {py})",
+            target.name()
         )))
     }
 
@@ -801,7 +1021,8 @@ impl DesktopServer {
             return Err("dx and dy are both 0; nothing to scroll".to_owned());
         }
         let mut operation = self.operation.lock().await;
-        let (x, y) = operation.map_point(target, args.x, args.y)?;
+        let (px, py) = operation.resolve_point(target, args.x, args.y, args.r#ref.as_deref())?;
+        let (x, y) = operation.map_point(target, px, py)?;
         let steps = vec![
             Step::Move(x, y),
             Step::Sleep(Duration::from_millis(20)),
@@ -810,10 +1031,8 @@ impl DesktopServer {
         operation.run_steps(target, steps, ct).await?;
         tokio::time::sleep(settle).await;
         Ok(text_result(format!(
-            "scrolled dx={dx} dy={dy} notches at {} pixel ({}, {})",
-            target.name(),
-            args.x,
-            args.y
+            "scrolled dx={dx} dy={dy} notches at {} pixel ({px}, {py})",
+            target.name()
         )))
     }
 
@@ -851,6 +1070,29 @@ impl DesktopServer {
             return Err("text is empty".to_owned());
         }
         let mut operation = self.operation.lock().await;
+        if let Some(r) = args.r#ref.as_deref() {
+            let node =
+                a11y::resolve_ref(operation.snapshots.get(&target), r, target.name())?.clone();
+            operation.approve_injection().await?;
+            let bus = operation.bus(target).await?;
+            if let Err(error) = bus.grab_focus(&node.handle).await {
+                // GTK4 text views answer GrabFocus with NotSupported; a real
+                // click on the element focuses it when its position is known.
+                let (px, py) = node.rect.map(a11y::center).ok_or_else(|| {
+                    format!(
+                        "focus {r} ({} \"{}\") failed and its position is unknown on the {} target: {error:#}",
+                        node.role,
+                        node.name,
+                        target.name()
+                    )
+                })?;
+                let (x, y) = operation.map_point(target, px, py)?;
+                operation
+                    .run_steps(target, click_steps(x, y, Button::Left, 1), ct)
+                    .await?;
+            }
+            tokio::time::sleep(PASTE_SETTLE).await;
+        }
         let plan = type_steps(&operation.keymap, &args.text, delay)?;
         let (typed, pasted) = (plan.typed_chars, plan.pasted_chars);
         operation.run_steps(target, plan.steps, ct).await?;
@@ -1081,7 +1323,7 @@ fn wrap(result: Result<CallToolResult, String>) -> Result<CallToolResult, McpErr
 impl DesktopServer {
     #[tool(
         name = "screen_info",
-        description = "Capture the target screen and report its width and height in screenshot pixels plus the coordinate system. Every input tool uses x,y pixel coordinates of the most recent screenshot of the same target, origin top-left. target: \"sandbox\" (default, recommended: does not touch the user's real mouse and keyboard) or \"desktop\" (the real screen)."
+        description = "Capture the target screen and report its width and height in screenshot pixels plus the coordinate system. Pixel tools take x,y in the most recent screenshot of the same target, origin top-left, or a ref from snapshot. target: \"sandbox\" (default, recommended: does not touch the user's real mouse and keyboard) or \"desktop\" (the real screen)."
     )]
     async fn screen_info(
         &self,
@@ -1092,7 +1334,7 @@ impl DesktopServer {
 
     #[tool(
         name = "screenshot",
-        description = "Capture the target screen and return a PNG image plus timestamp and size in pixels. Coordinates for later actions are pixel positions in this image, origin top-left. target: \"sandbox\" (default, recommended: the nested sandbox window, user keeps working) or \"desktop\" (the real screen via the XDG portal)."
+        description = "Capture the target screen and return a PNG image plus timestamp and size in pixels. Use it to see what is on screen. Coordinates for pixel actions are pixel positions in this image, origin top-left. target: \"sandbox\" (default, recommended: the nested sandbox window, user keeps working) or \"desktop\" (the real screen via the XDG portal)."
     )]
     async fn screenshot(
         &self,
@@ -1102,8 +1344,30 @@ impl DesktopServer {
     }
 
     #[tool(
+        name = "snapshot",
+        description = "Read the accessibility tree of the apps on the target and return one line per element: ref, role, name, position and size in screenshot pixels, available actions, state, and text content. Prefer acting through refs: activate performs an element's action without moving the pointer, and click/double_click/right_click/move/scroll/type accept a ref instead of x,y. Fall back to pixel coordinates from a screenshot when the element is not in the tree, has no usable action, or the task needs a real pointer at a position (canvas, hover, drag). Refs belong to the snapshot that produced them; after the UI changes, call snapshot again. On the desktop target, positions are unknown (Wayland), so use activate there. Apps must be launched after the sandbox started (sandbox_launch) to appear."
+    )]
+    async fn snapshot(
+        &self,
+        Parameters(args): Parameters<SnapshotArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        wrap(self.snapshot_action(args).await)
+    }
+
+    #[tool(
+        name = "activate",
+        description = "Perform an element's own action (click, press, toggle, activate...) through the accessibility tree, using a ref from the most recent snapshot. No pointer movement, works even when the element is covered. Returns an error listing the available actions when the name does not match. Use click with x,y or a ref when you need a real pointer click instead."
+    )]
+    async fn activate(
+        &self,
+        Parameters(args): Parameters<ActivateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        wrap(self.activate_action(args).await)
+    }
+
+    #[tool(
         name = "move",
-        description = "Move the pointer to x,y in screenshot pixels of the target (origin top-left). target: \"sandbox\" (default, recommended; does not move the user's real cursor) or \"desktop\" (moves the real cursor; the user must not touch the computer)."
+        description = "Move the real pointer to x,y in screenshot pixels of the target (origin top-left), or to the centre of a snapshot ref (sandbox only). Use it when hovering matters; prefer activate with a ref for ordinary actions. target: \"sandbox\" (default, recommended; does not move the user's real cursor) or \"desktop\" (moves the real cursor; the user must not touch the computer)."
     )]
     async fn move_pointer_tool(
         &self,
@@ -1115,7 +1379,7 @@ impl DesktopServer {
 
     #[tool(
         name = "click",
-        description = "Move to x,y (screenshot pixels, origin top-left) and click the left button. target: \"sandbox\" (default, recommended; the user's real mouse stays free) or \"desktop\" (real mouse; the user must not touch the computer)."
+        description = "Real pointer click: move to x,y (screenshot pixels, origin top-left), or to the centre of a snapshot ref (sandbox only), and click the left button. Prefer activate with a ref when the element has an action; use this when a real pointer position matters or the element is not in the tree. target: \"sandbox\" (default, recommended; the user's real mouse stays free) or \"desktop\" (real mouse; the user must not touch the computer)."
     )]
     async fn click(
         &self,
@@ -1130,7 +1394,7 @@ impl DesktopServer {
 
     #[tool(
         name = "double_click",
-        description = "Move to x,y (screenshot pixels, origin top-left) and double-click the left button, 60 ms apart. target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
+        description = "Real pointer double-click at x,y (screenshot pixels, origin top-left), or at the centre of a snapshot ref (sandbox only), 60 ms apart. Prefer activate with a ref when the element has an action; use this when a real pointer gesture is needed or the element is not in the tree. target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
     )]
     async fn double_click(
         &self,
@@ -1145,7 +1409,7 @@ impl DesktopServer {
 
     #[tool(
         name = "right_click",
-        description = "Move to x,y (screenshot pixels, origin top-left) and click the right button. target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
+        description = "Real pointer right-click at x,y (screenshot pixels, origin top-left), or at the centre of a snapshot ref (sandbox only), for context menus. Prefer activate with a ref when the element has an action; use this when a real pointer position is needed or the element is not in the tree. target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
     )]
     async fn right_click(
         &self,
@@ -1160,7 +1424,7 @@ impl DesktopServer {
 
     #[tool(
         name = "drag",
-        description = "Press the left button at `from`, move through optional `waypoints` to `to`, then release. All points are screenshot pixels of the target, origin top-left. Use it for text selection and drag-and-drop. target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
+        description = "Press the left button at `from`, move through optional `waypoints` to `to`, then release. All points are screenshot pixels of the target, origin top-left. Use it for text selection and drag-and-drop. Pixel coordinates only; refs are not accepted here. target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
     )]
     async fn drag(
         &self,
@@ -1172,7 +1436,7 @@ impl DesktopServer {
 
     #[tool(
         name = "scroll",
-        description = "Move to x,y (screenshot pixels) and scroll the wheel: dy notches down (negative = up), dx notches right (negative = left). target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
+        description = "Real pointer wheel scroll at x,y (screenshot pixels), or at the centre of a snapshot ref (sandbox only); there is no accessibility-tree equivalent, so this is the way to scroll. dy notches down (negative = up), dx notches right (negative = left). target: \"sandbox\" (default, recommended) or \"desktop\" (real mouse)."
     )]
     async fn scroll(
         &self,
@@ -1196,7 +1460,7 @@ impl DesktopServer {
 
     #[tool(
         name = "type",
-        description = "Type text into the focused window. US-layout characters (ASCII letters, digits, punctuation, newline, tab) are typed key by key; any other character (for example Chinese) is put on the target's clipboard and pasted with ctrl+v, which requires the focused app to support paste. No input method is simulated. Pure key injection, never a shell. target: \"sandbox\" (default, recommended) or \"desktop\" (real keyboard)."
+        description = "Type text into the focused window; pass a snapshot ref to focus that element first (both targets). US-layout characters (ASCII letters, digits, punctuation, newline, tab) are typed key by key; any other character (for example Chinese) is put on the target's clipboard and pasted with ctrl+v, which requires the focused app to support paste. No input method is simulated. Pure key injection, never a shell. target: \"sandbox\" (default, recommended) or \"desktop\" (real keyboard)."
     )]
     async fn type_text(
         &self,
@@ -1252,8 +1516,8 @@ impl DesktopServer {
         }) {
             Ok(sandbox) => {
                 let display = sandbox.display().to_owned();
+                operation.drop_sandbox();
                 operation.sandbox = Some(sandbox);
-                operation.screens.remove(&Target::Sandbox);
                 let mode = if options.visible {
                     "as a window on the real desktop (keep it visible and uncovered while taking screenshots)"
                 } else {
@@ -1305,8 +1569,7 @@ impl DesktopServer {
         let _ = operation
             .injector(Target::Sandbox)
             .and_then(|injector| injector.release_all().map_err(|error| error.to_string()));
-        tokio::task::block_in_place(|| operation.sandbox = None);
-        operation.screens.remove(&Target::Sandbox);
+        operation.drop_sandbox();
         Ok(text_result("sandbox stopped"))
     }
 }
@@ -1317,7 +1580,7 @@ impl ServerHandler for DesktopServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("wayhand-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                "wayhand-mcp drives a GNOME Wayland desktop: screenshot, then click/type/drag by screenshot pixel coordinates, then screenshot again to verify. {TARGET_DOC} Typical flow: sandbox_start -> sandbox_launch -> screenshot -> actions -> screenshot."
+                "wayhand-mcp drives a GNOME Wayland desktop. Look with screenshot; act with refs from snapshot (activate, or a ref on click/double_click/right_click/move/scroll/type) and fall back to screenshot pixel coordinates when the element is not in the tree, has no usable action, or a real pointer position is needed (canvas, hover, drag); then screenshot again to verify. {TARGET_DOC} Typical flow: sandbox_start -> sandbox_launch -> screenshot -> snapshot -> activate/click -> screenshot."
             ))
     }
 }
@@ -1409,6 +1672,9 @@ mod tests {
             screens: HashMap::new(),
             calibration: None,
             stop_release_done: false,
+            buses: HashMap::new(),
+            snapshots: HashMap::new(),
+            next_snapshot_id: 1,
         }
     }
 

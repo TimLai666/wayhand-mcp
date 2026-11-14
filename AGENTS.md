@@ -44,7 +44,9 @@ GNOME 的 Mutter 只有一組游標與鍵盤焦點，注入的輸入一定會搶
 
 ## MCP 工具清單
 
-`screen_info`、`screenshot`、`click`、`double_click`、`right_click`、`move`、`drag`（支援中途多個路徑點）、`scroll`、`type`、`key`（組合鍵，例如 `ctrl+shift+t`）、`calibrate`，以及沙盒管理的 `sandbox_start`、`sandbox_launch`、`sandbox_stop`。除了 `calibrate` 與沙盒管理工具，其餘都有 `target` 參數（`sandbox` 預設、`desktop`）。
+`screen_info`、`screenshot`、`snapshot`（AT-SPI 無障礙樹，每個元素一個 ref）、`activate`（對 ref 做元素自己的動作，不動游標）、`click`、`double_click`、`right_click`、`move`、`drag`（支援中途多個路徑點）、`scroll`、`type`、`key`（組合鍵，例如 `ctrl+shift+t`）、`calibrate`，以及沙盒管理的 `sandbox_start`、`sandbox_launch`、`sandbox_stop`。除了 `calibrate` 與沙盒管理工具，其餘都有 `target` 參數（`sandbox` 預設、`desktop`）。
+
+工具描述的分工（2026-11-14 決定）：`screenshot` 是用來看畫面的。操作優先走 `snapshot` 的 ref（`activate`，或 `click`／`type` 帶 `ref`）；元素不在樹上、沒有可用動作、或任務本來就要模擬滑鼠在某個位置（畫布、hover、拖曳）時，才退回截圖像素座標。`click`、`double_click`、`right_click`、`move`、`scroll` 的 `x,y` 與 `ref` 二擇一；`drag` 只收像素。
 
 每個工具的 description 必須寫清楚座標系與單位。`screenshot` 回傳 PNG image content 並附時間戳。`type` 要處理中文輸入的限制並誠實記錄做不到的部分。
 
@@ -113,5 +115,8 @@ cargo run --bin wayhand-mcp  # 以 stdio 啟動 server（給 claude mcp add 用�
 - GNOME portal 截圖不含游標，`calibrate` 改用沙盒視窗（純洋紅背景）當量尺。
 - 單一實例鎖只在建立 uinput 裝置時取得（desktop 模式），多個 Claude／Codex session 可以各自用沙盒；`claude mcp list` 的健康檢查也不會被鎖擋掉。
 - 發 release：更新 Cargo.toml 版本 → `cargo build --release` → 打包 `wayhand-mcp-vX.Y.Z-x86_64-linux.tar.gz`（binary、scripts/、README、LICENSE）與 `.sha256` → `git tag` → `gh release create`。安裝端 `scripts/install.sh` 靠 GitHub API 找最新 tag。
-- 截圖與座標沒有綁定識別碼，只靠操作佇列序列化。單一呼叫者下沒問題。
+- 截圖與座標沒有綁定識別碼，只靠操作佇列序列化。單一呼叫者下沒問題。snapshot 的 ref 則有綁定：每個 target 只保留最新一份 snapshot，舊 id 的 ref 會被拒絕。
+- 沙盒自己起一組私有 AT-SPI bus（`dbus-daemon` + `at-spi2-registryd`，位於沙盒 runtime 目錄），`sandbox_launch` 以 `AT_SPI_BUS_ADDRESS` 餵給 app，所以不依賴 session 的無障礙 bus（這台機器的 session bus socket 曾經消失過）。GTK app 必須在 bus 存在後才啟動才會註冊。
+- GTK 4.14 的 popover 選單項目沒有無障礙名稱（snapshot 顯示 `menu item ""`），座標也是被 compositor 推回畫面前的值；選單請看截圖用像素點，或用旁邊標的快捷鍵。同一 app 的第二個視窗（對話框）靠標題或大小對到 sway 視窗，對不上就不給座標。
+- GTK4 在 Wayland 的 AT-SPI SCREEN 座標全為 0；沙盒改用 WINDOW 座標加上 sway IPC（`SWAYSOCK` 指到沙盒目錄的 `sway.sock`）查到的視窗位置。真實桌面查不到視窗位置，所以 desktop 的 snapshot 沒有座標，只能用 `activate`。
 - visible 沙盒視窗被遮住、縮小或在別的工作區時 GNOME 不給畫面，screencopy 會 5 秒逾時；headless 沒這問題，所以 headless 是預設。`calibrate` 自己開臨時的可見量尺視窗（tag `ruler`），不動工作用的沙盒。

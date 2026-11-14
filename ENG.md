@@ -50,6 +50,27 @@ target=desktop
 
 Mutter has one seat and no protocol to deliver input to an unfocused window, so the sandbox is the only way to keep the user's cursor free. Both targets share tools, validation, safety budget and the `Injector` trait; each target has its own injector and screenshot source.
 
+## Accessibility layer (added 2026-11-14)
+
+```text
+[server.rs snapshot/activate, ref on pixel tools]
+        |
+   [a11y.rs]  pure: filter_nodes, format_snapshot, parse_ref, resolve_ref,
+        |            center, sway_window_offsets   (unit-tested, a11y_tests.rs)
+        |     Bus: zbus dynamic proxies on org.a11y.atspi.* (walk, do_action, grab_focus)
+        |
+  sandbox: private dbus-daemon (accessibility.conf) + at-spi2-registryd in the
+           sandbox dir; apps get AT_SPI_BUS_ADDRESS from sandbox_launch;
+           window origin per pid from `swaymsg -s <dir>/sway.sock -t get_tree`
+  desktop: session bus -> org.a11y.Bus.GetAddress; no window positions on Wayland
+```
+
+Refs are `s<snapshot>:e<index>`; one snapshot per target is kept and a ref from
+an older id is refused. `activate` counts as an injection for the circuit
+breaker; `snapshot` does not reset it (only a screenshot proves the model
+looked). The walk is bounded by `max_nodes * 8` raw visits (cap 5000) and a
+15 s timeout.
+
 ## Decisions
 
 - Injection writes `/dev/uinput` directly (evdev crate). ydotool was dropped: apt ships 0.1.8 without absolute pointer moves. The server itself is the long-lived virtual device, so there is no daemon or socket.
@@ -63,6 +84,7 @@ Mutter has one seat and no protocol to deliver input to an unfocused window, so 
 | `Injector` trait | the uinput device (`FakeInjector` records events) | tool logic, breaker and ordering are testable without hardware |
 | `coords::Transform` | nothing, pure function | corner, rounding and range tests |
 | `safety::Budget` | time via `with_config` | breaker and stop flag tests |
+| `a11y` pure functions | nothing; `Node` values built in tests | filtering, formatting, ref parsing and sway tree parsing without a bus |
 | stdio JSON-RPC | none, run the binary with `WAYHAND_FAKE_INJECTOR=1` | proves the MCP contract (initialize, tools/list, tools/call) |
 
 Real uinput and the portal are exercised only in the manual demo on the developer's desktop.

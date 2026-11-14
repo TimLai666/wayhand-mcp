@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rmcp::ServiceExt;
 
+mod a11y;
 mod calibrate;
 mod coords;
 mod inject;

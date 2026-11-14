@@ -1,9 +1,11 @@
 # wayhand-mcp
 
 `wayhand-mcp` is a local MCP server that lets Claude Code see and operate a
-GNOME Wayland desktop: screenshot, click/type/drag by screenshot pixel
-coordinates, screenshot again to verify. It talks to Claude over stdio only
-and never opens a network port.
+GNOME Wayland desktop. It looks with `screenshot`, acts through the
+accessibility tree (`snapshot` gives every element a ref, `activate` runs the
+element's own action) or by screenshot pixel coordinates when a real pointer
+position is needed, then screenshots again to verify. It talks to Claude over
+stdio only and never opens a network port.
 
 Tested on Zorin OS 18.1 (GNOME Shell 46, Wayland). X11 is not supported.
 
@@ -57,11 +59,12 @@ Build the release binary:
 cargo build --release
 ```
 
-Install `sway` for the sandbox target and `wl-clipboard` for pasting text that
-the US keyboard layout cannot type:
+Install `sway` for the sandbox target, `wl-clipboard` for pasting text that
+the US keyboard layout cannot type, and `dbus` plus `at-spi2-core` for the
+sandbox's private accessibility bus (`snapshot` and `activate`):
 
 ```bash
-sudo apt install sway wl-clipboard
+sudo apt install sway wl-clipboard dbus at-spi2-core
 ```
 
 For the desktop target, allow your user to open `/dev/uinput`. The udev rule
@@ -96,12 +99,14 @@ claude mcp add wayhand-mcp -- /absolute/path/to/target/release/wayhand-mcp
 |---|---|
 | `sandbox_start` / `sandbox_launch` / `sandbox_stop` | Start the sandbox desktop (headless 1920×1080 by default, or `visible: true` for a window on the real desktop; `width`/`height` for headless), launch a program inside it (argv array, no shell), stop it and its apps. |
 | `screen_info` | Capture the target and report width, height and the coordinate system. |
-| `screenshot` | Capture the target and return a PNG plus timestamp and size. |
-| `move`, `click`, `double_click`, `right_click` | Pointer actions at `x,y` in screenshot pixels. |
-| `drag` | Press at `from`, move through optional `waypoints`, release at `to`. |
-| `scroll` | Wheel notches at `x,y`; positive `dy` scrolls down. |
+| `screenshot` | Capture the target and return a PNG plus timestamp and size. This is how the model sees the screen. |
+| `snapshot` | Read the accessibility tree (AT-SPI) of the apps on the target as text: one line per element with a ref such as `s3:e12`, role, name, position and size in screenshot pixels, plain actions, state and text content. `interactive` (default true) keeps only interactive elements and their windows; `app` narrows to one app; `max_nodes` caps the output (default 300). Refs belong to the snapshot that produced them. |
+| `activate` | Run an element's own action (`Click`, `Toggle`, ... as listed in the snapshot, case-insensitive) through the accessibility tree with a ref from the latest snapshot. The pointer does not move and the element may be covered. Works on both targets. |
+| `move`, `click`, `double_click`, `right_click` | Real pointer actions at `x,y` in screenshot pixels, or at the centre of a snapshot `ref` (sandbox only). |
+| `drag` | Press at `from`, move through optional `waypoints`, release at `to`. Pixel coordinates only. |
+| `scroll` | Wheel notches at `x,y` or at a snapshot `ref` (sandbox only); positive `dy` scrolls down. |
 | `key` | Key combo such as `ctrl+shift+t`, `alt+F4`, `Return`. |
-| `type` | Type text; characters outside the US layout are pasted through the clipboard with `ctrl+v`. |
+| `type` | Type text; a snapshot `ref` focuses that element first. Characters outside the US layout are pasted through the clipboard with `ctrl+v`. |
 | `calibrate` | Desktop target only: opens a temporary magenta ruler window, moves the real cursor to known positions inside it, reads the cursor back from the ruler, and stores the verified pixel→pointer mapping with the worst deviation against the 3 px limit. |
 
 Coordinates are always pixel positions in the most recent screenshot of the
@@ -110,7 +115,18 @@ pointer. Desktop coordinates are mapped linearly onto the uinput absolute axes.
 Every action accepts `settle_ms` (default 150) to wait for the UI to settle.
 
 Typical flow: `sandbox_start` → `sandbox_launch ["gnome-text-editor", "--standalone"]`
-→ `screenshot` → `click` / `type` / `drag` → `screenshot` to verify.
+→ `screenshot` → `snapshot` → `activate` / `click` / `type` → `screenshot` to verify.
+
+When to use which: `screenshot` is for seeing. For acting, prefer refs from
+`snapshot`; fall back to pixel coordinates when the element is not in the
+tree, has no usable action, or the task needs a real pointer at a position
+(canvas drawing, hover, drag).
+
+The sandbox runs its own accessibility bus (`dbus-daemon` with the AT-SPI
+config plus `at-spi2-registryd`, both from `at-spi2-core`) and hands its
+address to every launched app, so the tree is private to the sandbox and does
+not depend on the session's own accessibility bus. The desktop target uses the
+session bus; GTK apps register only if they started after that bus existed.
 
 ## Safety
 
@@ -139,7 +155,9 @@ Typical flow: `sandbox_start` → `sandbox_launch ["gnome-text-editor", "--stand
 | Sandbox start (sway nested) | ~210 ms |
 | Sandbox screenshot (1280×720 visible window) | ~165 ms |
 | Sandbox screenshot (1920×1080 headless, screencopy → PNG) | ~20-35 ms empty screen, ~165 ms with an app window |
-| Headless sandbox start | ~110-210 ms |
+| Headless sandbox start | ~110-210 ms, plus ~60-300 ms for the private accessibility bus (dbus-daemon, registryd readiness) |
+| `snapshot` of gnome-text-editor in the sandbox | ~130-1250 ms (15-45 nodes shown, ~100 raw); first call after launch is the slow one |
+| `activate` (AT-SPI DoAction) | ~5 ms plus settle |
 | Sandbox click including default 150 ms settle | ~152 ms |
 | Desktop screenshot via portal, after permission grant | ~510-670 ms (2880×1800) |
 | Desktop screenshot, first call with permission dialog | ~8.4 s |
@@ -174,6 +192,29 @@ guard. Neither affects the sandbox target or the screenshot portal.
   `ctrl+v`, so it only works in apps that accept paste, and it replaces the
   clipboard content.
 - Touchpad gestures (multi-finger swipe, pinch) cannot be produced.
+- Apps launched with `sandbox_launch` share your real `HOME`, so a text editor
+  opened in the sandbox writes its drafts and session to your profile. Pass
+  `["env", "XDG_DATA_HOME=/tmp/some-dir", "gnome-text-editor", "--standalone"]`
+  when that matters.
+- GTK4 reports nested leaf controls (a `toggle button` inside a `button`) a few
+  pixels off, and it marks the text box of a hidden tab as showing and focused
+  with the visible tab's text. Prefer `activate` on the outer control, and read
+  the text box under the tab panel you expect.
+- GTK 4.14 exposes popover menu items without any accessible name (the
+  snapshot shows `menu item ""`), and their positions are the ones GTK computed
+  before the compositor slid the popup on screen. Read the open menu from a
+  screenshot and click by pixel, or use the shortcut shown next to the item.
+- A second window of the same app (dialog, preferences) is matched to its sway
+  toplevel by title, else by size; when that is ambiguous its nodes carry no
+  position and only `activate` works on them.
+- `snapshot` on the desktop target carries no positions: GTK4 on Wayland
+  reports every screen coordinate as 0 and GNOME does not expose window
+  positions. Use `activate` with the ref, or `click` with pixels from a
+  screenshot. In the sandbox, window positions come from sway IPC.
+- Only apps that expose an accessibility tree appear in `snapshot`: GTK3/GTK4
+  work as is, Qt needs `QT_ACCESSIBILITY=1`, Chromium needs
+  `--force-renderer-accessibility`, and canvas-style or self-drawn UIs expose
+  nothing. Use pixel tools for those.
 - Desktop-target coordinates use a linear mapping over one screen;
   multi-monitor layouts are not handled.
 - Desktop screenshots from the GNOME portal do not include the cursor, which
